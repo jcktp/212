@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use common::proto::{
     AgentMode, DownloadPhase, DownloadProgress, Event, Fit, InferenceState, ModelSummary, NoticeLevel, ReportLine, ReportStatus, Request,
-    SearchHit, SettingValue, Snapshot,
+    SearchHit, SettingValue, Snapshot, TranscriptItem,
 };
 use common::{StreamEvent, format};
 use config::{AnimationMode, UiConfig};
@@ -59,6 +59,8 @@ pub enum Entry {
         summary: String,
         detail: Option<String>,
     },
+    /// A compaction summary standing in for older messages.
+    Summary(String),
     Notice {
         level: NoticeLevel,
         text: String,
@@ -90,6 +92,7 @@ pub enum PickerKind {
     Models,
     Search,
     Provider,
+    Sessions,
 }
 
 pub struct Picker {
@@ -132,6 +135,11 @@ pub enum Overlay {
     None,
     Picker(Picker),
     Choice(ChoiceDialog),
+    /// Masked entry for an API key. Never recorded in input history.
+    Secret {
+        provider: String,
+        buf: String,
+    },
 }
 
 pub struct Completion {
@@ -189,6 +197,9 @@ pub struct App {
     pub keyboard_enhanced: bool,
     /// Show full tool output, diffs and reasoning (Ctrl+O).
     pub show_details: bool,
+    /// (cpu %, used, total, model memory) for the header.
+    pub stats: Option<(f32, u64, u64, Option<u64>)>,
+    pub weather: Option<String>,
     /// The tool currently running, for the activity line.
     pub current_tool: Option<(String, String)>,
     onboarding: Onboarding,
@@ -240,6 +251,8 @@ impl App {
             config_path: opts.config_path,
             keyboard_enhanced: opts.keyboard_enhanced,
             show_details: false,
+            stats: None,
+            weather: None,
             current_tool: None,
             onboarding: if opts.first_run { Onboarding::Theme } else { Onboarding::Off },
             files: None,
@@ -478,6 +491,58 @@ impl App {
             Event::Choice { id, title, body, options, preview } => {
                 self.overlay = Overlay::Choice(ChoiceDialog { id, title, body, options, preview, selected: 0 });
             }
+            Event::SessionList { title, items } => {
+                let items = items
+                    .into_iter()
+                    .map(|i| PickItem { key: i.id, label: i.title, detail: i.detail, tag: i.current.then(|| "current".into()) })
+                    .collect();
+                self.overlay = Overlay::Picker(Picker {
+                    kind: PickerKind::Sessions,
+                    title,
+                    hint: "Enter resume · Ctrl+D delete · type to filter · Esc close".into(),
+                    items,
+                    selected: 0,
+                    filter: String::new(),
+                });
+            }
+            Event::Transcript { title, items } => {
+                if !title.is_empty() {
+                    self.entries.clear();
+                    self.scroll = 0;
+                    self.notice(NoticeLevel::Info, format!("Resumed: {title}"));
+                }
+                for it in items {
+                    match it {
+                        TranscriptItem::User(t) => self.push(Entry::User(t)),
+                        TranscriptItem::Assistant { text, reasoning } => {
+                            let model = self.snapshot.model.clone().unwrap_or_default();
+                            let continuation = matches!(self.entries.last().map(|e| &e.entry), Some(Entry::Tool { .. }));
+                            self.push(Entry::Assistant {
+                                text,
+                                reasoning: reasoning.unwrap_or_default(),
+                                streaming: false,
+                                stats: None,
+                                show_reasoning: self.show_details,
+                                model,
+                                continuation,
+                            });
+                        }
+                        TranscriptItem::Tool { title, ok, summary } => self.push(Entry::Tool {
+                            id: String::new(),
+                            tool: String::new(),
+                            title,
+                            status: if ok { ToolStatus::Ok } else { ToolStatus::Failed },
+                            summary,
+                            detail: None,
+                        }),
+                        TranscriptItem::Summary(s) => self.push(Entry::Summary(s)),
+                    }
+                }
+            }
+            Event::Stats { cpu_percent, mem_used, mem_total, model_mem } => {
+                self.stats = Some((cpu_percent, mem_used, mem_total, model_mem))
+            }
+            Event::Weather(w) => self.weather = w,
             Event::Dismiss { id } => {
                 if matches!(&self.overlay, Overlay::Choice(c) if c.id == id) {
                     self.overlay = Overlay::None;
@@ -513,7 +578,7 @@ impl App {
         if list.is_empty() {
             self.notice(
                 NoticeLevel::Info,
-                "No models installed yet. /recommend shows models suited to this machine; /models search <name> searches Hugging Face; /models import <file.gguf> or /models import ollama adds existing files.",
+                "No models available. /models search <name> searches Hugging Face; /models import <file.gguf> adds a file you have.",
             );
             return;
         }
@@ -529,20 +594,36 @@ impl App {
                 };
                 let mem = m.est_memory.map(|e| format!(" · ~{} RAM {fit}", format::bytes(e))).unwrap_or_default();
                 let caps = if m.capabilities.is_empty() { String::new() } else { format!(" · {}", m.capabilities.join(",")) };
-                PickItem {
-                    key: m.id.clone(),
-                    label: m.id.clone(),
-                    detail: format!("{} · {} · {}{mem}{caps} · {}", m.arch, m.quant, format::bytes(m.size), m.source),
-                    tag: m.active.then(|| "active".into()),
+                if m.installed {
+                    PickItem {
+                        key: m.id.clone(),
+                        label: m.id.clone(),
+                        detail: format!("{} · {} · {}{mem}{caps} · {}", m.arch, m.quant, format::bytes(m.size), m.source),
+                        tag: Some(if m.active { "loaded".into() } else { "installed".into() }),
+                    }
+                } else {
+                    let spec = m.install_spec.clone().unwrap_or_default();
+                    let on_disk = spec.starts_with("ollama:");
+                    PickItem {
+                        key: spec,
+                        label: m.name.clone(),
+                        detail: if on_disk {
+                            format!("{} · {}{mem}{caps}", format::bytes(m.size), m.source)
+                        } else {
+                            format!("{}{mem}{caps}", m.source)
+                        },
+                        tag: Some(if on_disk { "on disk".into() } else { "download".into() }),
+                    }
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let selected = items.iter().position(|i| i.tag.as_deref() == Some("loaded")).unwrap_or(0);
         self.overlay = Overlay::Picker(Picker {
             kind: PickerKind::Models,
-            title: "Installed models".into(),
-            hint: "Enter load · i info · Del remove · type to filter · Esc close".into(),
+            title: "Models · Enter switches (installs first if needed)".into(),
+            hint: "Enter use · i info · Ctrl+D remove · type to filter · Esc close".into(),
             items,
-            selected: 0,
+            selected,
             filter: String::new(),
         });
     }
@@ -568,6 +649,7 @@ impl App {
 
     pub fn on_paste(&mut self, s: &str) {
         match &mut self.overlay {
+            Overlay::Secret { buf, .. } => buf.push_str(s.trim()),
             Overlay::Picker(p) => {
                 p.filter.push_str(s.lines().next().unwrap_or(""));
                 p.clamp();
@@ -600,6 +682,23 @@ impl App {
         match &mut self.overlay {
             Overlay::Choice(_) => return self.on_choice_key(k),
             Overlay::Picker(_) => return self.on_picker_key(k),
+            Overlay::Secret { buf, provider } => {
+                match k.code {
+                    KeyCode::Esc => self.overlay = Overlay::None,
+                    KeyCode::Enter => {
+                        let (provider, secret) = (provider.clone(), std::mem::take(buf));
+                        self.overlay = Overlay::None;
+                        self.send(Request::SetCredential { provider, secret });
+                    }
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    KeyCode::Char('u') if ctrl => buf.clear(),
+                    KeyCode::Char(c) if !ctrl => buf.push(c),
+                    _ => {}
+                }
+                return;
+            }
             Overlay::None => {}
         }
         if self.completion.is_some() && self.on_completion_key(k) {
@@ -782,18 +881,30 @@ impl App {
             KeyCode::Esc => return self.close_overlay(true),
             KeyCode::Enter => return self.picker_accept(),
             KeyCode::Char('i') if p.kind == PickerKind::Models && p.filter.is_empty() => {
-                if let Some(item) = p.current() {
+                if let Some(item) = p.current().filter(|i| matches!(i.tag.as_deref(), Some("loaded" | "installed"))) {
                     let id = item.key.clone();
                     self.overlay = Overlay::None;
                     self.send(Request::ModelInfo { id });
                 }
                 return;
             }
-            KeyCode::Delete if p.kind == PickerKind::Models => {
-                if let Some(item) = p.current() {
-                    let id = item.key.clone();
-                    self.overlay = Overlay::None;
-                    self.send(Request::RemoveModel { id });
+            KeyCode::Delete | KeyCode::Char('d')
+                if (k.code == KeyCode::Delete || k.modifiers.contains(KeyModifiers::CONTROL))
+                    && matches!(p.kind, PickerKind::Models | PickerKind::Sessions) =>
+            {
+                let Some(item) = p.current().cloned() else { return };
+                match p.kind {
+                    PickerKind::Models if matches!(item.tag.as_deref(), Some("loaded" | "installed")) => {
+                        self.overlay = Overlay::None;
+                        self.send(Request::RemoveModel { id: item.key });
+                    }
+                    PickerKind::Models => {
+                        self.toast("Not installed — nothing to remove".into());
+                    }
+                    _ => {
+                        self.overlay = Overlay::None;
+                        self.send(Request::DeleteSession { id: item.key });
+                    }
                 }
                 return;
             }
@@ -833,7 +944,8 @@ impl App {
                 self.toast(format!("Theme: {}", item.label));
                 self.advance_onboarding();
             }
-            PickerKind::Models => self.send(Request::LoadModel { id: item.key }),
+            PickerKind::Models => self.send(Request::UseModel { spec: item.key }),
+            PickerKind::Sessions => self.send(Request::ResumeSession { id: Some(item.key) }),
             PickerKind::Search => self.send(Request::Pull { spec: item.key }),
             PickerKind::Provider => self.send(Request::SetProvider { provider: item.key, model: None }),
         }
@@ -1009,7 +1121,43 @@ impl App {
                     }
                 }
             }
-            "recommend" => self.send(Request::Recommend),
+            "recommend" => self.send(Request::ListModels),
+            "sessions" => self.send(Request::ListSessions { all: arg(0) == "all" }),
+            "resume" | "continue" => self.send(Request::ResumeSession { id: (!c.args.is_empty()).then(|| arg(0)) }),
+            "rename" => self.send(Request::RenameSession { title: c.rest.clone() }),
+            "history" => self.send(Request::SearchHistory { query: c.rest.clone() }),
+            "export" => {
+                let (fmt, path) = match arg(0).as_str() {
+                    "md" | "markdown" | "json" => (arg(0), c.args.get(1).cloned()),
+                    "" => ("md".into(), None),
+                    _ => ("md".into(), Some(c.rest.clone())),
+                };
+                self.send(Request::Export { format: fmt, path });
+            }
+            "key" | "keys" => match (arg(0).as_str(), arg(1).as_str()) {
+                ("remove" | "rm" | "delete", p) if !p.is_empty() => self.send(Request::RemoveCredential { provider: p.into() }),
+                ("", _) => self.notice(
+                    NoticeLevel::Info,
+                    "Usage: /key <openai|anthropic|compat|huggingface> stores a key in the system keychain; /key remove <provider> deletes it. Environment variables still take precedence.",
+                ),
+                (p, _) => self.overlay = Overlay::Secret { provider: p.to_lowercase(), buf: String::new() },
+            },
+            "weather" => match arg(0).as_str() {
+                "" => self.notice(NoticeLevel::Info, "Usage: /weather <place> shows the weather in the header (via open-meteo.com); /weather off hides it."),
+                "off" => self.send(Request::SetWeather { location: None }),
+                _ => self.send(Request::SetWeather { location: Some(c.rest.clone()) }),
+            },
+            "skills" => match arg(0).as_str() {
+                "add" | "install" => self.send(Request::InstallSkill { source: after(1) }),
+                _ => self.send(Request::ListSkills),
+            },
+            "skill" => {
+                if c.args.is_empty() {
+                    self.send(Request::ListSkills);
+                } else {
+                    self.send(Request::UseSkill { name: c.rest.clone() });
+                }
+            }
             "provider" => {
                 if c.args.is_empty() {
                     let items = [
@@ -1041,12 +1189,8 @@ impl App {
                     self.send(Request::SetProvider { provider: arg(0), model });
                 }
             }
-            "context" | "compact" => {
-                if c.name == "compact" {
-                    self.notice(NoticeLevel::Info, "Automatic compaction is planned. Today, older turns are left out (and you're told) when the window fills; /new starts fresh.");
-                }
-                self.send(Request::Context);
-            }
+            "context" => self.send(Request::Context),
+            "compact" => self.send(Request::Compact),
             "status" => self.send(Request::Status),
             "doctor" => {
                 let terminal = self.terminal_report();

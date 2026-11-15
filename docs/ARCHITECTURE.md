@@ -52,7 +52,9 @@ crates/
   inference  hardware detection, llama-server discovery, verified installer, process supervisor
   providers  Provider trait + OpenAI-compatible, Anthropic and mock implementations, SSE parser
   tools      typed agent tools: JSON-schema definitions, validation, workspace confinement, diffs, process control
-  runtime    the orchestrator: conversation, agent loop, permission policy, model lifecycle, downloads, providers
+  sessions   SQLite persistence (WAL, FTS5 search, schema versioning), Markdown/JSON export
+  runtime    the orchestrator: conversation, agent loop, permission policy, sessions, compaction, skills,
+             credentials (keychain), model lifecycle, downloads, providers, header stats/weather
   tui        Ratatui UI: themes, glyphs, ASCII art, animations, markdown, composer, overlays
   app        the `212` binary: CLI, logging, signals, headless mode
 ```
@@ -134,6 +136,18 @@ user message ─► model call (tools offered for the mode) ─► text? ──�
 | Terminal diversity (keyboard protocols, colors, glyphs) | Detect conservatively. Offer Alt+Enter and Ctrl+J as universal newline keys. Downgrade colors and glyphs. Config overrides exist. |
 | Windows | Process supervision and paths are cross-platform. Untested so far (CI matrix configured). |
 | Hugging Face / registry API changes or rate limits | Clear error messages. Downloads resume. The curated catalog doesn't depend on search. |
+
+## Sessions and context
+
+- **Storage.** One SQLite file (WAL mode, `PRAGMA user_version` migrations, FTS5 index kept in sync by triggers). Sessions are keyed by the canonical working directory. A session is created lazily on the first completed turn, and each turn (the user message plus every assistant/tool message) is appended when it finishes. Failed empty turns are not saved.
+- **Compaction.** The current model summarizes everything except the last two exchanges, using a prompt that preserves instructions, decisions, paths and open tasks. The summary goes into the system prompt, and `compacted_upto` records which messages it covers. Nothing is deleted, so export and search still see the full transcript. Compaction runs automatically when context selection would otherwise drop messages, then sends the pending message, and the user is told either way.
+- **Resume** restores the post-compaction history into context, shows the whole transcript, restores the mode, and notes when the session used a different model.
+
+## Web, skills, credentials
+
+- **`web_fetch`** (`tools::web`): http/https only, no embedded credentials. Hosts are refused if they are local names or resolve to loopback/private/link-local/CGNAT addresses (checked after DNS, and on every redirect, at most 5). Responses are capped at 3 MB and HTML is converted to text (scripts/styles/nav dropped, headings/lists/code kept). It is a `Network`-kind tool, so the policy asks per host with a session grant. `@https://` links in a user message are fetched without asking (the user typed them) and appended as labelled `<web_page>` data.
+- **Skills** follow the open `SKILL.md` format. Only name and description are always in the prompt (progressive disclosure). `load_skill` returns the body plus a list of bundled files. Project skills override user skills. Installation copies folders (from git clones or local paths), skipping `.git` and symlinks, and executes nothing.
+- **Credentials** come from the environment first, then the OS keychain (`keyring`: macOS Keychain, Windows Credential Manager, Secret Service). The TUI's key prompt is a separate masked overlay that bypasses input history.
 
 ## Extension points
 

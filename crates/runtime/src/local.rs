@@ -47,6 +47,7 @@ impl Runtime {
             c.cancel();
         }
         let old = self.server.take();
+        self.backend_pid.store(0, std::sync::atomic::Ordering::Relaxed);
         if self.provider_name == "local" {
             self.provider = None;
             self.model_name = None;
@@ -131,12 +132,14 @@ impl Runtime {
         match result {
             Ok(server) => {
                 let provider = OpenAiCompatible::new("local", &server.api_base(), Some(server.api_key.clone()), "the local backend");
+                self.backend_pid.store(server.pid().unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
                 self.server = Some(server);
                 self.active_local = Some(id.clone());
                 if self.provider_name == "local" {
                     self.provider = Some(Arc::new(provider));
                     self.model_name = Some(id.clone());
                 }
+                self.sync_session_settings();
                 self.save_setting("inference", "default_model", id.clone().into());
                 self.config.inference.default_model = Some(id.clone());
                 self.emit(Event::Inference(InferenceState::Ready)).await;
@@ -166,6 +169,7 @@ impl Runtime {
         match self.server.take() {
             Some(s) => {
                 s.shutdown().await;
+                self.backend_pid.store(0, std::sync::atomic::Ordering::Relaxed);
                 self.active_local = None;
                 if self.provider_name == "local" {
                     self.provider = None;

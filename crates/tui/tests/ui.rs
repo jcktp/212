@@ -290,3 +290,109 @@ fn permission_dialog_shows_preview_and_answers() {
     a.on_core(Event::Dismiss { id: 4 });
     assert!(matches!(a.overlay, Overlay::None) && a.outbox.is_empty());
 }
+
+fn summary(id: &str, installed: bool, active: bool, spec: Option<&str>) -> common::proto::ModelSummary {
+    common::proto::ModelSummary {
+        id: id.into(),
+        name: id.into(),
+        quant: "Q4_K_M".into(),
+        arch: "llama".into(),
+        size: 2 << 30,
+        context_length: None,
+        est_memory: Some(3 << 30),
+        fit: common::proto::Fit::Comfortable,
+        source: if installed { "local file".into() } else { "on disk (Ollama) · no download".into() },
+        path: Default::default(),
+        capabilities: vec![],
+        active,
+        installed,
+        install_spec: spec.map(String::from),
+    }
+}
+
+#[test]
+fn models_picker_switches_installs_and_removes() {
+    let (mut a, _t) = app();
+    a.on_core(Event::Models(vec![
+        summary("llava-phi3-latest", true, true, None),
+        summary("gemma4:12b", false, false, Some("ollama:gemma4:12b")),
+    ]));
+    let screen = render(&mut a, 100, 30);
+    assert!(screen.contains("[loaded]") && screen.contains("[on disk]"), "{screen}");
+    // The loaded model is preselected; move to gemma and press Enter.
+    key(&mut a, KeyCode::Down);
+    key(&mut a, KeyCode::Enter);
+    assert!(matches!(a.outbox.last(), Some(Request::UseModel { spec }) if spec == "ollama:gemma4:12b"));
+    // Ctrl+D on an installed model asks the runtime to remove it (which confirms).
+    a.on_core(Event::Models(vec![summary("llava-phi3-latest", true, true, None)]));
+    ctrl(&mut a, 'd');
+    assert!(matches!(a.outbox.last(), Some(Request::RemoveModel { id }) if id == "llava-phi3-latest"));
+}
+
+#[test]
+fn sessions_picker_resumes_and_transcript_replaces_view() {
+    let (mut a, _t) = app();
+    a.on_core(Event::SessionList {
+        title: "Sessions".into(),
+        items: vec![common::proto::SessionItem {
+            id: "abc123".into(),
+            title: "Parser fix".into(),
+            detail: "2h ago".into(),
+            current: false,
+        }],
+    });
+    key(&mut a, KeyCode::Enter);
+    assert!(matches!(a.outbox.last(), Some(Request::ResumeSession { id: Some(id) }) if id == "abc123"));
+    a.on_core(Event::Transcript {
+        title: "Parser fix · 2h ago".into(),
+        items: vec![
+            common::proto::TranscriptItem::Summary("- Done: fixed the lexer".into()),
+            common::proto::TranscriptItem::User("now the parser".into()),
+            common::proto::TranscriptItem::Assistant { text: "Done.".into(), reasoning: None },
+        ],
+    });
+    let screen = render(&mut a, 100, 30);
+    assert!(screen.contains("Resumed: Parser fix") && screen.contains("fixed the lexer") && screen.contains("now the parser"), "{screen}");
+}
+
+#[test]
+fn api_keys_are_masked_and_never_enter_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hist = tmp.path().join("history");
+    let mut a = App::new(TuiOptions {
+        ui: config::UiConfig { startup_animation: false, ..Default::default() },
+        themes_dir: tmp.path().join("themes"),
+        history_file: hist.clone(),
+        config_path: tmp.path().join("config.toml"),
+        first_run: false,
+        warnings: vec![],
+        cwd: tmp.path().to_path_buf(),
+        keyboard_enhanced: false,
+    });
+    type_str(&mut a, "/key anthropic");
+    a.completion = None;
+    key(&mut a, KeyCode::Enter);
+    type_str(&mut a, "sk-ant-secret");
+    let screen = render(&mut a, 100, 30);
+    assert!(!screen.contains("sk-ant-secret") && screen.contains("•••••"), "{screen}");
+    key(&mut a, KeyCode::Enter);
+    assert!(
+        matches!(a.outbox.last(), Some(Request::SetCredential { provider, secret }) if provider == "anthropic" && secret == "sk-ant-secret")
+    );
+    let saved = std::fs::read_to_string(&hist).unwrap_or_default();
+    assert!(!saved.contains("sk-ant"), "history must not contain the key: {saved}");
+}
+
+#[test]
+fn header_shows_stats_and_weather_when_room() {
+    let (mut a, _t) = app();
+    a.on_core(Event::Snapshot(Snapshot { provider: "local".into(), model: Some("qwen".into()), cwd: "/p".into(), ..Default::default() }));
+    a.on_core(Event::Stats { cpu_percent: 23.4, mem_used: 11 << 30, mem_total: 16 << 30, model_mem: Some(3 << 30) });
+    a.on_core(Event::Weather(Some("rain 12°C Amsterdam".into())));
+    let wide = render(&mut a, 140, 10);
+    let header = wide.lines().next().unwrap();
+    assert!(header.contains("cpu 23% · ram 11.0G/16.0G · model 3.0G") && header.contains("☂ 12°C Amsterdam"), "{header}");
+    let narrow = render(&mut a, 60, 10);
+    let header = narrow.lines().next().unwrap();
+    assert!(header.contains("local") && header.contains("qwen"), "{header}");
+}

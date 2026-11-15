@@ -1,6 +1,6 @@
 # Progress
 
-_Last updated: 2026-11-15 · version 0.1.0 · Phase 5 complete_
+_Last updated: 2026-11-15 · version 0.1.0 · Phase 6 complete_
 
 ## First working milestone: done
 
@@ -20,6 +20,18 @@ daemon. The managed-backend run also had Homebrew removed from `PATH`.
 | 7–8 | Type a message and receive a real streamed reply | Qwen3-0.6B Q8_0: 108–120 tok/s; llava-phi3 (Q4_K_M from the Ollama store): ~38 tok/s |
 | 9 | Status animations | boot sequence, loading bar, spinner, pulse, bounce, scan (checksum), download bar |
 | 10 | Clean exit with no background processes | Ctrl+C, `/quit`, SIGTERM, SIGHUP all stop llama-server. After SIGKILL the next launch reaps the orphan. |
+
+## Phase 6 (persistence and providers) and requested extras: done
+
+Verified in a real terminal (tmux) with Gemma 4 12B on the managed backend:
+
+- **Model switching from one list.** In a fresh home with only `llava-phi3` installed, `/models` listed llava `[loaded]`, `gemma4:12b [on disk]` and six `[download]` recommendations. One Enter on Gemma imported it from the Ollama store (hard link, no download), loaded it, and stopped the llava server (one llama-server left). Removal asks for confirmation and says what is deleted versus kept.
+- **Sessions.** After quitting, `212 -c` restored the transcript and mode and autoloaded the model. `/history example domain` found the earlier session by full text (with a highlighted snippet). `/export` wrote Markdown with session metadata.
+- **Links and web.** `@https://example.com` was fetched and answered from. A plain README link made the model call `web_fetch`; the approval offered "Allow raw.githubusercontent.com this session", and the answer used the fetched README.
+- **Skills.** `/skills add <folder>` installed a sample `haiku-writer` skill. On "Write a haiku about terminals" the model called `load_skill` itself and followed the skill's format exactly.
+- **Header.** `cpu 12% · ram 13.1G/16.0G · model 7.7G │ ☁ 9°C Amsterdam` (weather via `/weather Amsterdam`).
+
+Bugs found and fixed while verifying: session metadata recorded an empty model name when a model loaded (fixed ordering); a lock-ordering deadlock in session lookup by id prefix (caught by tests); Windows-only lint failures in CI.
 
 ## Phase 5 (agent runtime): done
 
@@ -46,7 +58,7 @@ terminal. Demo project: a two-function Python module with a bug
 | 3 Local inference | ✅ |
 | 4 Model management | ✅ except `/models benchmark` and vision projectors |
 | 5 Agent runtime | ✅ tools, permission policy, agent loop, chat/plan/build modes, diff previews, audit log |
-| 6 Persistence and providers | 🟡 providers done; sessions/SQLite, export, history search, keychain storage and compaction not started |
+| 6 Persistence and providers | ✅ SQLite sessions (save, resume, rename, delete, per project), full-text history, Markdown/JSON export, manual and automatic compaction, keychain credentials, `-c`/`--resume` |
 | 7 Polish and release | 🟡 onboarding and benchmarks done; packaging and cross-platform testing not started |
 
 ## What works
@@ -65,11 +77,12 @@ terminal. Demo project: a two-function Python module with a bug
 
 - **No OS sandbox for commands.** They run with your user's privileges in the project directory. The approval dialog is the safeguard, and the risky-command detector is a heuristic warning, not a guarantee.
 - **Small models are weak agents.** Qwen3-0.6B declares tool support but rarely uses tools well. Gemma 4 12B worked, but needed retries on exact-match edits. Prefer 8B+ models for build mode, or a cloud provider.
-- **No documentation/web fetch tool** yet, and no undo/checkpoint for applied edits (use git).
+- **No undo/checkpoint** for applied edits (use git).
 - **The context meter** updates after each message, not live during a multi-step turn.
-- **No persistent sessions.** The conversation lives in memory. `/new`, `/clear` and `/context` work; `/sessions`, `/resume`, `/history` and `/export` are not implemented.
-- **Context:** when the window fills, the oldest turns are left out and the user is told. There is no summarizing compaction yet (`/compact` explains this).
-- **Credentials** come from environment variables only (no keychain integration yet).
+- **Keychain storage** is implemented and compiles on all platforms, but writing to the real macOS Keychain was not exercised during testing (to avoid modifying it). Environment variables work as before.
+- **Compaction quality** depends on the model; small models write weaker summaries. The full transcript is always kept.
+- **Web:** no JavaScript rendering (pages that need it come back mostly empty), no PDFs, and no search engine. `web_fetch` reads URLs; it doesn't search.
+- **Skills:** bundled scripts run through `run_command` (build mode, with approval). Models without tool support can only use skills activated with `/skill`.
 - **Model loading progress** is indeterminate, because llama.cpp exposes no load progress.
 - **Downloads** can be cancelled and resumed (`Esc`, then pull again). There is no separate pause button.
 - **Backend installer** picks the portable CPU build on Linux/Windows. Use `inference.server_path` for CUDA/Vulkan builds.
@@ -79,7 +92,7 @@ terminal. Demo project: a two-function Python module with a bug
 
 ## Test results
 
-`cargo fmt --check` ✅ · `cargo clippy --all-targets -- -D warnings` ✅ · `cargo test`: **138 passed, 0 failed, 1 ignored**
+`cargo fmt --check` ✅ · `cargo clippy --all-targets -- -D warnings` ✅ · `cargo test`: **161 passed, 0 failed, 1 ignored**
 
 | Suite | Tests | Covers |
 | --- | --- | --- |
@@ -90,7 +103,9 @@ terminal. Demo project: a two-function Python module with a bug
 | providers | 8 | SSE parsing across chunk boundaries/UTF-8, OpenAI chunk mapping (text/reasoning/tools/usage/speed/errors), real HTTP streaming, connect errors, key never leaks, Anthropic body/events |
 | tools | 14 | argument validation, path confinement and symlink escapes, protected files, read/list/find/grep with .gitignore, write/edit diffs, stale-edit refusal, exit codes, env scrubbing, **timeout and cancel kill the whole process group**, git status, project and test-command detection |
 | runtime | 9 + 9 + 10 | context selection, `@file` safety, policy matrix, audit log, text tool-call fallback; **mock-provider integration**: streaming, history, cancellation keeps partial text, failed turns not duplicated, retries, concurrency guard, shutdown, errors; **agent loop**: reads run unasked and feed back, approved edit applies the diff, denied edit leaves the file and informs the model, session grant, plan mode refuses writes, chat offers no tools, invalid args become tool errors, step limit, cancel kills a running command, cancel dismisses a pending approval |
-| tui | 28 + 14 | themes (all 8, custom, validation, color degradation), glyphs, art, animations (static under reduced motion), markdown wrapping/highlighting, composer, commands; **TestBackend UI**: every theme at 5 sizes, picker preview/restore/persist, sending, streaming render, slash → request mapping, Ctrl+C semantics, dialogs, ASCII-only output, monochrome output, idle never ticks, completion, tool activity and diff rendering, permission dialog preview/answer/dismiss, template-token stripping |
+| sessions | 5 | round trip, listing, rename/delete cascade, FTS search incl. hostile query syntax, compaction metadata, Markdown/JSON export, on-disk persistence, refusal of newer schemas |
+| runtime (sessions) | 5 | persist → restart → `--continue` → model sees history; list/search/rename/export; separate sessions after `/new` and confirmed delete; manual compaction keeps the last two exchanges; automatic compaction when the window fills; model removal asks first |
+| tui | 28 + 18 | themes (all 8, custom, validation, color degradation), glyphs, art, animations (static under reduced motion), markdown wrapping/highlighting, composer, commands; **TestBackend UI**: every theme at 5 sizes, picker preview/restore/persist, sending, streaming render, slash → request mapping, Ctrl+C semantics, dialogs, ASCII-only output, monochrome output, idle never ticks, completion, tool activity and diff rendering, permission dialog preview/answer/dismiss, template-token stripping |
 | app | 4 + 1 ignored | CLI smoke tests; `real_inference` (opt-in, passes: import → load → stream → clean exit) |
 
 Run the real-inference test:
@@ -113,6 +128,5 @@ TWO_ONE_TWO_TEST_GGUF=/path/to/Qwen3-0.6B-Q8_0.gguf cargo test -p two-one-two --
 
 ## Next milestones
 
-1. **Sessions (Phase 6):** SQLite (rusqlite, bundled): sessions per project, resume, rename, delete, search, export to Markdown/JSON, provider/model metadata. Summarizing `/compact`. Keychain credential storage.
-2. **Agent polish:** an opt-in documentation fetch tool, checkpoints/undo for applied edits, a live context meter during turns, and optional OS sandboxing (macOS `sandbox-exec` profiles, Linux namespaces/landlock).
-3. **Release (Phase 7):** CI on all three OSes, release binaries with checksums, a Homebrew tap, a terminal compatibility pass, `/models benchmark`, vision projector support.
+1. **Agent polish:** checkpoints/undo for applied edits, a live context meter during turns, a pluggable web search provider, and optional OS sandboxing (macOS `sandbox-exec` profiles, Linux namespaces/landlock).
+2. **Release (Phase 7):** CI on all three OSes, release binaries with checksums, a Homebrew tap, a terminal compatibility pass, `/models benchmark`, vision projector support.

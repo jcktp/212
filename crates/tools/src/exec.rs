@@ -206,7 +206,7 @@ pub async fn git(root: &Path, args: &[String], cancel: &CancellationToken) -> To
 mod tests {
     use super::*;
     use crate::tests::ctx;
-    use crate::{ToolKind, execute, plan};
+    use crate::{execute, plan};
 
     #[test]
     fn flags_dangerous_commands() {
@@ -228,7 +228,7 @@ mod tests {
         unsafe { std::env::set_var("TWO_ONE_TWO_TEST_SECRET", "hunter2") };
         let p =
             plan("run_command", r#"{"command":"echo out; echo err >&2; echo ${TWO_ONE_TWO_TEST_SECRET:-none}; pwd; exit 3"}"#, &c).unwrap();
-        assert_eq!(p.kind, ToolKind::Execute);
+        assert_eq!(p.kind, crate::ToolKind::Execute);
         assert!(p.danger.is_none());
         let out = execute(&p, &c).await;
         assert!(!out.ok);

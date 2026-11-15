@@ -16,6 +16,7 @@ mod exec;
 mod fsops;
 mod paths;
 mod project;
+pub mod web;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,6 +38,17 @@ pub enum ToolKind {
     Write,
     /// Runs a process. Build mode only; needs approval.
     Execute,
+    /// Reads a web page. Any mode; asks per site unless configured otherwise.
+    Network,
+    /// Loads an installed skill's instructions. Any mode; never asks.
+    Skill,
+}
+
+/// An installed skill the model may load.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillRef {
+    pub name: String,
+    pub dir: PathBuf,
 }
 
 /// Shared execution context.
@@ -47,6 +59,8 @@ pub struct ToolCtx {
     pub command_timeout: Duration,
     /// Environment variables removed before running commands (API keys etc.).
     pub scrub_env: Vec<String>,
+    pub skills: Vec<SkillRef>,
+    pub http: Option<web::Client>,
 }
 
 /// A validated, ready-to-run tool call.
@@ -76,6 +90,8 @@ enum Action {
     Write { path: PathBuf, rel: String, content: String, original: Option<String> },
     Edit { path: PathBuf, rel: String, original: String, updated: String },
     Command { command: String, timeout: Duration },
+    Fetch { url: String },
+    LoadSkill { skill: SkillRef },
 }
 
 /// Result of running a tool.
@@ -177,6 +193,18 @@ const SPECS: &[Spec] = &[
         kind: ToolKind::Read,
         description: "Show recent commits.",
         params: || json!({"type":"object","properties":{"count":{"type":"integer","description":"Number of commits (default 10, max 50)"}}}),
+    },
+    Spec {
+        name: "web_fetch",
+        kind: ToolKind::Network,
+        description: "Fetch a web page or text document (http/https) and return its readable text. Use for documentation and links the user mentions.",
+        params: || json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+    },
+    Spec {
+        name: "load_skill",
+        kind: ToolKind::Skill,
+        description: "Load the full instructions of an installed skill by name. Do this before doing a task the skill covers.",
+        params: || json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
     },
     Spec {
         name: "write_file",
@@ -294,6 +322,14 @@ struct TestArgs {
 }
 #[derive(Deserialize)]
 struct NoArgs {}
+#[derive(Deserialize)]
+struct FetchArgs {
+    url: String,
+}
+#[derive(Deserialize)]
+struct SkillArgs {
+    name: String,
+}
 
 /// Validate a tool call and work out exactly what it would do.
 pub fn plan(name: &str, raw_args: &str, ctx: &ToolCtx) -> Result<Plan, String> {
@@ -433,6 +469,29 @@ pub fn plan(name: &str, raw_args: &str, ctx: &ToolCtx) -> Result<Plan, String> {
                 Action::Command { command, timeout: Duration::from_secs(600) },
             ))
         }
+        "web_fetch" => {
+            let a: FetchArgs = args(name, raw_args)?;
+            let url = web::validate_url(&a.url)?;
+            let host = url.host_str().unwrap_or("").to_string();
+            Ok(mk(
+                format!("fetch {}", one_line(url.as_str())),
+                Some(url.to_string()),
+                None,
+                format!("web:{host}"),
+                Action::Fetch { url: url.to_string() },
+            ))
+        }
+        "load_skill" => {
+            let a: SkillArgs = args(name, raw_args)?;
+            let skill = ctx.skills.iter().find(|s| s.name.eq_ignore_ascii_case(a.name.trim())).cloned().ok_or_else(|| {
+                format!(
+                    "no skill named '{}'. Installed: {}",
+                    a.name,
+                    ctx.skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                )
+            })?;
+            Ok(mk(format!("load skill {}", skill.name), None, None, "skill".into(), Action::LoadSkill { skill }))
+        }
         _ => Err(format!("unknown tool '{name}'")),
     }
 }
@@ -463,8 +522,42 @@ pub async fn execute(plan: &Plan, ctx: &ToolCtx) -> ToolOutput {
         Action::Write { path, rel, content, original } => fsops::write(path, rel, content, original.as_deref()),
         Action::Edit { path, rel, original, updated } => fsops::edit(path, rel, original, updated),
         Action::Command { command, timeout } => exec::run_command(&root, command, *timeout, &ctx.scrub_env, &ctx.cancel).await,
+        Action::Fetch { url } => match &ctx.http {
+            None => ToolOutput::error("web access is disabled"),
+            Some(c) => tokio::select! {
+                r = web::fetch(c, url) => match r {
+                    Ok(page) => {
+                        let n = page.text.chars().count();
+                        ToolOutput::ok(page.render(), format!("{} · {} chars", page.title.chars().take(50).collect::<String>(), n))
+                    }
+                    Err(e) => ToolOutput::error(e),
+                },
+                _ = ctx.cancel.cancelled() => ToolOutput::error("cancelled"),
+            },
+        },
+        Action::LoadSkill { skill } => load_skill(skill),
     };
     ToolOutput { content: truncate_middle(&out.content, MAX_RESULT_CHARS), ..out }
+}
+
+fn load_skill(skill: &SkillRef) -> ToolOutput {
+    let md = skill.dir.join("SKILL.md");
+    let text = match std::fs::read_to_string(&md) {
+        Ok(t) => t,
+        Err(e) => return ToolOutput::error(format!("cannot read {}: {e}", md.display())),
+    };
+    // List bundled resources so the model knows what else it can read or run.
+    let mut files = Vec::new();
+    for e in ignore::WalkBuilder::new(&skill.dir).max_depth(Some(3)).build().flatten().take(200) {
+        if e.file_type().is_some_and(|t| t.is_file()) && e.path() != md {
+            files.push(e.path().display().to_string());
+        }
+    }
+    let mut out = format!("Skill '{}' (directory: {})\n\n{text}", skill.name, skill.dir.display());
+    if !files.is_empty() {
+        out.push_str(&format!("\n\nBundled files (read them with run_command, e.g. `cat <path>`, only if needed):\n{}", files.join("\n")));
+    }
+    ToolOutput::ok(out, format!("{} lines", text.lines().count()))
 }
 
 /// Keep the beginning and end of long output; the middle is usually least useful.
@@ -489,6 +582,8 @@ mod tests {
             cancel: CancellationToken::new(),
             command_timeout: Duration::from_secs(30),
             scrub_env: vec!["TWO_ONE_TWO_TEST_SECRET".into()],
+            skills: vec![],
+            http: None,
         }
     }
 
@@ -496,7 +591,8 @@ mod tests {
     fn definitions_filter_by_kind() {
         let read = definitions(&[ToolKind::Read]);
         assert!(read.iter().all(|d| kind_of(d["function"]["name"].as_str().unwrap()) == Some(ToolKind::Read)));
-        assert_eq!(definitions(&[ToolKind::Read, ToolKind::Write, ToolKind::Execute]).len(), SPECS.len());
+        let all = [ToolKind::Read, ToolKind::Write, ToolKind::Execute, ToolKind::Network, ToolKind::Skill];
+        assert_eq!(definitions(&all).len(), SPECS.len());
         for d in definitions(&[ToolKind::Read, ToolKind::Write, ToolKind::Execute]) {
             assert_eq!(d["function"]["parameters"]["type"], "object");
         }

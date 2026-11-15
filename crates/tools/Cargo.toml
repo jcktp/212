@@ -14,6 +14,9 @@ ignore.workspace = true
 similar.workspace = true
 regex.workspace = true
 globset.workspace = true
+reqwest.workspace = true
+models.workspace = true
+futures.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

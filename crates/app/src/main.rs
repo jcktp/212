@@ -27,6 +27,12 @@ struct Cli {
     /// Provider for this run: local, ollama, openai, anthropic, compat.
     #[arg(long)]
     provider: Option<String>,
+    /// Continue the most recent session in this directory.
+    #[arg(short = 'c', long = "continue")]
+    continue_last: bool,
+    /// Resume a specific session by id (prefix).
+    #[arg(long)]
+    resume: Option<String>,
     /// Agent mode for this run: chat, plan or build.
     #[arg(long)]
     mode: Option<String>,
@@ -59,6 +65,62 @@ enum Cmd {
     Backend,
     /// Print configuration and data locations.
     Paths,
+    /// List saved sessions for this directory (`--all` for every project).
+    Sessions {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Search saved conversations.
+    History { query: Vec<String> },
+    /// Store or remove an API key in the system keychain.
+    Key {
+        #[command(subcommand)]
+        action: KeyCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Store a key (typed without echo, or piped on stdin).
+    Set { provider: String },
+    /// Remove a stored key.
+    Remove { provider: String },
+}
+
+/// Read a secret from the terminal without echo, or a line from piped stdin.
+fn read_secret(prompt: &str) -> anyhow::Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        let mut s = String::new();
+        std::io::stdin().lock().read_line(&mut s)?;
+        return Ok(s.trim().to_string());
+    }
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    crossterm::terminal::enable_raw_mode()?;
+    let mut s = String::new();
+    let result = loop {
+        match crossterm::event::read() {
+            Ok(crossterm::event::Event::Key(k)) if k.kind != crossterm::event::KeyEventKind::Release => match k.code {
+                crossterm::event::KeyCode::Enter => break Ok(()),
+                crossterm::event::KeyCode::Esc => break Err(anyhow::anyhow!("cancelled")),
+                crossterm::event::KeyCode::Char('c') if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    break Err(anyhow::anyhow!("cancelled"));
+                }
+                crossterm::event::KeyCode::Backspace => {
+                    s.pop();
+                }
+                crossterm::event::KeyCode::Char(c) => s.push(c),
+                _ => {}
+            },
+            Ok(crossterm::event::Event::Paste(p)) => s.push_str(&p),
+            Ok(_) => {}
+            Err(e) => break Err(e.into()),
+        }
+    };
+    crossterm::terminal::disable_raw_mode()?;
+    eprintln!();
+    result.map(|_| s.trim().to_string())
 }
 
 #[derive(Subcommand)]
@@ -128,6 +190,7 @@ fn main() -> anyhow::Result<()> {
                 config_path: config_path.clone(),
                 cwd: cwd.clone(),
                 autoload: needs_model,
+                resume: if cli.continue_last { Some(None) } else { cli.resume.clone().map(Some) },
             },
             ev_tx,
         )
@@ -174,6 +237,15 @@ fn main() -> anyhow::Result<()> {
             let job = match (&cli.command, prompt) {
                 (Some(Cmd::Doctor), _) => headless::Job::Doctor,
                 (Some(Cmd::Backend), _) => headless::Job::Request(Request::InstallBackend),
+                (Some(Cmd::Sessions { all }), _) => headless::Job::Request(Request::ListSessions { all: *all }),
+                (Some(Cmd::History { query }), _) => headless::Job::Request(Request::SearchHistory { query: query.join(" ") }),
+                (Some(Cmd::Key { action: KeyCmd::Remove { provider } }), _) => {
+                    headless::Job::Request(Request::RemoveCredential { provider: provider.clone() })
+                }
+                (Some(Cmd::Key { action: KeyCmd::Set { provider } }), _) => {
+                    let secret = read_secret(&format!("{provider} API key (input hidden): "))?;
+                    headless::Job::Request(Request::SetCredential { provider: provider.clone(), secret })
+                }
                 (Some(Cmd::Paths), _) => {
                     println!("config   {}", config_path.display());
                     println!("data     {}", paths.data_dir.display());

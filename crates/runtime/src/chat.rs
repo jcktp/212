@@ -20,22 +20,35 @@ impl Runtime {
                      Paths are relative to the project root. Prefer find_files/grep/read_file over guessing. \
                      Call tools only when they help; when you have what you need, answer directly.";
         let brief = tools::project_brief(&self.cwd);
-        Message::system(match self.mode {
-            AgentMode::Chat => format!("{base} The user's working directory is {cwd}."),
-            AgentMode::Plan => format!(
-                "{base}\n\nYou are in PLAN mode inside the project at {cwd}. {brief}\
+        let mut extra = String::new();
+        if let Some(sum) = &self.summary {
+            extra.push_str(&format!("\n\nSummary of the earlier part of this conversation (older messages were compacted):\n{sum}"));
+        }
+        let can_load_skills = !(self.provider_name == "local"
+            && !self.active_local.as_ref().and_then(|id| self.store.find(id).ok()).is_some_and(|m| m.capabilities.tool_calling));
+        extra.push_str(&self.skills_prompt(can_load_skills));
+        if self.config.agent.web_access != "off" {
+            extra.push_str("\n\nYou can read web pages with web_fetch when the user asks about a link or you need current documentation.");
+        }
+        Message::system(extra_prompt(
+            extra,
+            match self.mode {
+                AgentMode::Chat => format!("{base} The user's working directory is {cwd}."),
+                AgentMode::Plan => format!(
+                    "{base}\n\nYou are in PLAN mode inside the project at {cwd}. {brief}\
                  You can inspect the project with read-only tools (read_file, list_dir, find_files, grep, project_info, git_status, git_diff, git_log). \
                  You cannot modify files or run commands. Investigate the relevant code, then produce a concrete, step-by-step implementation plan \
                  naming the files and changes.\n\n{agent}"
-            ),
-            AgentMode::Build => format!(
-                "{base}\n\nYou are in BUILD mode: a coding agent working in the project at {cwd}. {brief}\
+                ),
+                AgentMode::Build => format!(
+                    "{base}\n\nYou are in BUILD mode: a coding agent working in the project at {cwd}. {brief}\
                  You can read files, edit them (edit_file for targeted changes, write_file for new files), run commands and tests. \
                  The user approves each edit and command, and may deny it — if denied, do not retry the same action. \
                  Work in small steps: inspect before editing, keep edits minimal, run the tests to verify, and finish with a short summary \
                  of what changed and what remains.\n\n{agent}"
-            ),
-        })
+                ),
+            },
+        ))
     }
 
     pub(crate) async fn send(&mut self, text: String) {
@@ -57,6 +70,11 @@ impl Runtime {
             return self.notice(NoticeLevel::Warn, msg).await;
         };
 
+        let raw_text = text.clone();
+        let urls = crate::web::mentioned_urls(&text);
+        if !urls.is_empty() && self.config.agent.web_access == "off" {
+            self.notice(NoticeLevel::Warn, "Links are not fetched: web access is off (agent.web_access).").await;
+        }
         let (text, outcomes) = crate::attach::expand(&text, &self.cwd);
         for o in outcomes {
             match o {
@@ -73,10 +91,17 @@ impl Runtime {
                 }
             }
         }
+        self.turn_start = self.messages.len();
         self.messages.push(Message::user(text));
         let ctx = self.context_size();
         let reserve = self.config.inference.max_tokens.unwrap_or(ctx / 4).min(ctx / 2);
         let (messages, dropped) = context::select(Some(&self.system_prompt()), &self.messages, ctx.saturating_sub(reserve));
+        let auto = self.config.sessions.auto_compact && !std::mem::take(&mut self.skip_auto_compact);
+        if dropped > 0 && auto {
+            // Summarize older turns first, then send this message.
+            self.messages.pop();
+            return self.compact(Some(raw_text)).await;
+        }
         if dropped > 0 {
             self.notice(
                 NoticeLevel::Info,
@@ -84,7 +109,8 @@ impl Runtime {
             )
             .await;
         }
-        let mut tool_defs = tools::definitions(crate::permissions::offered(self.mode));
+        let kinds = crate::permissions::offered_with(self.mode, &self.config.agent.web_access, !self.skills.is_empty());
+        let mut tool_defs = tools::definitions(&kinds);
         if !tool_defs.is_empty() && self.provider_name == "local" {
             let supports =
                 self.active_local.as_ref().and_then(|id| self.store.find(id).ok()).map(|m| m.capabilities.tool_calling).unwrap_or(false);
@@ -117,7 +143,11 @@ impl Runtime {
                 cancel: cancel.clone(),
                 command_timeout: std::time::Duration::from_secs(120),
                 scrub_env: scrub,
+                skills: self.skill_refs(),
+                http: (self.config.agent.web_access != "off").then(tools::web::client),
             },
+            urls: if self.config.agent.web_access == "off" { Vec::new() } else { urls },
+            user_index: self.turn_start,
             max_steps: self.config.agent.max_steps,
             budget: ctx.saturating_sub(reserve),
             events: self.events.clone(),
@@ -130,4 +160,8 @@ impl Runtime {
         self.emit(Event::TurnStart).await;
         tokio::spawn(run.run(None));
     }
+}
+
+fn extra_prompt(extra: String, base: String) -> String {
+    format!("{base}{extra}")
 }

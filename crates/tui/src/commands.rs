@@ -8,16 +8,26 @@ pub struct CommandSpec {
 
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "help", args: "", help: "Show commands and keys" },
-    CommandSpec { name: "models", args: "[search|pull|import|remove|info|switch|cancel] …", help: "Model manager" },
+    CommandSpec { name: "models", args: "[search|pull|import|remove|info|switch|cancel] …", help: "Switch, install or remove models" },
     CommandSpec { name: "model", args: "[id]", help: "Show the active model, or switch to one" },
     CommandSpec { name: "recommend", args: "", help: "Models suited to this machine" },
     CommandSpec { name: "provider", args: "[local|ollama|openai|anthropic|compat] [model]", help: "Switch AI provider" },
-    CommandSpec { name: "theme", args: "[name]", help: "Pick a color theme (live preview)" },
-    CommandSpec { name: "animations", args: "on|reduced|off", help: "Configure animations" },
+    CommandSpec { name: "key", args: "<provider> | remove <provider>", help: "Store an API key in the system keychain" },
     CommandSpec { name: "mode", args: "chat|plan|build", help: "Change agent mode" },
     CommandSpec { name: "new", args: "", help: "Start a new conversation" },
-    CommandSpec { name: "clear", args: "", help: "Clear the conversation view" },
+    CommandSpec { name: "sessions", args: "[all]", help: "Browse saved sessions" },
+    CommandSpec { name: "resume", args: "[id]", help: "Resume the last (or a given) session" },
+    CommandSpec { name: "rename", args: "<title>", help: "Rename this session" },
+    CommandSpec { name: "history", args: "<words>", help: "Search all saved conversations" },
+    CommandSpec { name: "export", args: "[md|json] [path]", help: "Export this conversation" },
+    CommandSpec { name: "compact", args: "", help: "Summarize older messages to free context" },
     CommandSpec { name: "context", args: "", help: "Show context usage" },
+    CommandSpec { name: "skills", args: "[add <git URL|owner/repo|folder>]", help: "List or install skills" },
+    CommandSpec { name: "skill", args: "<name>", help: "Activate a skill for this conversation" },
+    CommandSpec { name: "theme", args: "[name]", help: "Pick a color theme (live preview)" },
+    CommandSpec { name: "animations", args: "on|reduced|off", help: "Configure animations" },
+    CommandSpec { name: "weather", args: "<place>|off", help: "Weather in the header" },
+    CommandSpec { name: "clear", args: "", help: "Clear the conversation view" },
     CommandSpec { name: "status", args: "", help: "Show runtime status" },
     CommandSpec { name: "doctor", args: "", help: "Run diagnostics" },
     CommandSpec { name: "copy", args: "[code]", help: "Copy the last reply (or its code) via OSC 52" },
@@ -81,6 +91,7 @@ mod tests {
     fn completes_prefixes() {
         let names: Vec<_> = complete("/mo").iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["models", "model", "mode"]);
+        assert!(complete("/se").iter().any(|c| c.name == "sessions"));
         assert_eq!(complete("").len(), COMMANDS.len());
         assert!(complete("/zzz").is_empty());
     }

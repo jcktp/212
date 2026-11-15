@@ -61,7 +61,7 @@ fn fit_label(fit: Fit) -> &'static str {
 
 impl Runtime {
     fn hf(&self) -> HfClient {
-        let token = std::env::var(&self.config.models.huggingface_token_env).ok().filter(|t| !t.is_empty());
+        let token = crate::credentials::lookup("huggingface", &self.config.models.huggingface_token_env);
         HfClient::new(self.http.clone(), token)
     }
 
@@ -81,11 +81,96 @@ impl Runtime {
             path: m.path.clone(),
             capabilities: m.capabilities.labels(),
             active: self.active_local.as_deref() == Some(&m.id),
+            installed: true,
+            install_spec: None,
         }
     }
 
+    /// Installed models first, then models already on disk in an Ollama
+    /// store, then curated downloads that suit this machine.
+    pub(crate) fn model_catalog(&self) -> Vec<ModelSummary> {
+        let mut list: Vec<ModelSummary> = self.store.list().iter().map(|m| self.summarize(m)).collect();
+        let mem = self.hardware.model_memory();
+        let installed_sources: Vec<ModelSource> = self.store.list().iter().map(|m| m.source.clone()).collect();
+        if let Some(dir) = ollama::local_models_dir() {
+            for m in ollama::scan_local(&dir).into_iter().filter(|m| m.problem.is_none()) {
+                let src = ModelSource::Ollama { name: m.reference.name.clone(), tag: m.reference.tag.clone() };
+                if installed_sources.contains(&src) {
+                    continue;
+                }
+                let need = rough_need(m.size);
+                list.push(ModelSummary {
+                    id: m.reference.display(),
+                    name: m.reference.display(),
+                    quant: String::new(),
+                    arch: String::new(),
+                    size: m.size,
+                    context_length: None,
+                    est_memory: Some(need),
+                    fit: estimate::fit(need, mem),
+                    source: "on disk (Ollama) · no download".into(),
+                    path: m.model_blob.clone(),
+                    capabilities: vec![],
+                    active: false,
+                    installed: false,
+                    install_spec: Some(format!("ollama:{}", m.reference.display())),
+                });
+            }
+        }
+        for e in catalog::recommend(mem) {
+            let repo = e.spec.split(':').next().unwrap_or(e.spec);
+            if installed_sources.iter().any(|s| matches!(s, ModelSource::HuggingFace { repo: r, .. } if r == repo)) {
+                continue;
+            }
+            let size = (e.approx_gib as f64 * (1u64 << 30) as f64) as u64;
+            list.push(ModelSummary {
+                id: e.title.to_string(),
+                name: e.title.to_string(),
+                quant: String::new(),
+                arch: String::new(),
+                size,
+                context_length: None,
+                est_memory: Some(rough_need(size)),
+                fit: estimate::fit(rough_need(size), mem),
+                source: format!("download ~{:.1} GB · {}", e.approx_gib, e.blurb),
+                path: Default::default(),
+                capabilities: if e.tools { vec!["tools".into()] } else { vec![] },
+                active: false,
+                installed: false,
+                install_spec: Some(e.spec.to_string()),
+            });
+        }
+        list
+    }
+
+    /// Switch to a model, installing it first if needed.
+    pub(crate) async fn use_model(&mut self, spec: &str) {
+        let spec = spec.trim();
+        if let Ok(m) = self.store.find(spec) {
+            let id = m.id.clone();
+            if self.active_local.as_deref() == Some(&id) && self.provider_name == "local" {
+                return self.notice(NoticeLevel::Info, format!("{id} is already loaded.")).await;
+            }
+            if self.provider_name != "local" {
+                self.provider_name = "local".into();
+                self.save_setting("inference", "provider", "local".into());
+            }
+            return self.load_model(&id).await;
+        }
+        // Anything installed from here on is loaded right away.
+        self.load_next_install = true;
+        if spec.starts_with("ollama:")
+            && let Some(r) = OllamaRef::parse(spec)
+            && let Some(local) =
+                ollama::local_models_dir().map(|d| ollama::scan_local(&d)).unwrap_or_default().into_iter().find(|m| m.reference == r)
+        {
+            return self.import_ollama_local(local).await;
+        }
+        self.pull(spec).await;
+    }
+
     pub(crate) async fn list_models(&mut self) {
-        let list: Vec<ModelSummary> = self.store.list().iter().map(|m| self.summarize(m)).collect();
+        let list = self.model_catalog();
         self.emit(Event::Models(list)).await;
     }
 
@@ -141,11 +226,34 @@ impl Runtime {
         self.emit(Event::Report { title: format!("Model · {}", m.id), art: None, lines }).await;
     }
 
+    /// Ask before removing; the answer calls [`Self::remove_model_confirmed`].
     pub(crate) async fn remove_model(&mut self, query: &str) {
-        let id = match self.store.find(query) {
-            Ok(m) => m.id.clone(),
+        let m = match self.store.find(query) {
+            Ok(m) => m.clone(),
             Err(e) => return self.notice(NoticeLevel::Error, e.to_string()).await,
         };
+        let what = if m.managed {
+            let original = match &m.source {
+                ModelSource::Local { original } if m.path != *original => " (a hard link: the original file elsewhere is kept)",
+                ModelSource::Ollama { .. } => " (a hard link: Ollama's own copy is kept)",
+                _ => "",
+            };
+            format!("Deletes {} from 212's model store{original}.", format::bytes(m.size))
+        } else {
+            format!("Forgets the entry; the file at {} is left untouched.", m.path.display())
+        };
+        let active = if self.active_local.as_deref() == Some(&m.id) { " It is currently loaded and will be unloaded." } else { "" };
+        self.choice(
+            crate::PendingAction::RemoveModel(m.id.clone()),
+            format!("Remove {}?", m.id),
+            vec![format!("{what}{active}")],
+            vec!["Remove".into(), "Keep".into()],
+        )
+        .await;
+    }
+
+    pub(crate) async fn remove_model_confirmed(&mut self, id: &str) {
+        let id = id.to_string();
         if self.active_local.as_deref() == Some(&id) {
             self.unload().await;
         }
@@ -199,6 +307,9 @@ impl Runtime {
     }
 
     async fn offer_load(&mut self, id: &str) {
+        if std::mem::take(&mut self.load_next_install) {
+            return self.load_model(id).await;
+        }
         if !self.autoload {
             return;
         }

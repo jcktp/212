@@ -46,6 +46,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.overlay {
         Overlay::Picker(_) => draw_picker(f, app, area),
         Overlay::Choice(_) => draw_choice(f, app, area),
+        Overlay::Secret { provider, buf } => draw_secret(f, app, area, provider, buf.chars().count()),
         Overlay::None => {}
     }
     if !app.glyphs.unicode {
@@ -201,19 +202,40 @@ fn status_dot(app: &App) -> (String, Style) {
     }
 }
 
+fn gib(b: u64) -> String {
+    format!("{:.1}G", b as f64 / (1u64 << 30) as f64)
+}
+
+/// "rain 12°C Amsterdam" → "☂ 12°C Amsterdam".
+fn weather_text(w: &str, unicode: bool) -> String {
+    let (label, rest) = w.split_once(' ').unwrap_or((w, ""));
+    if !unicode {
+        return w.to_string();
+    }
+    let glyph = match label {
+        "clear" => "☼",
+        "partly" => "◐",
+        "cloudy" => "☁",
+        "fog" => "≡",
+        "drizzle" | "rain" => "☂",
+        "snow" => "❄",
+        "storm" => "ϟ",
+        _ => label,
+    };
+    format!("{glyph} {rest}")
+}
+
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let g = app.glyphs;
     let s = &app.snapshot;
     let (dot, dot_style) = status_dot(app);
     let path = short_path(&s.cwd);
-    let path = if path.width() > 28 {
-        format!("…{}", path.chars().rev().take(26).collect::<String>().chars().rev().collect::<String>())
+    let path = if path.width() > 24 {
+        format!("…{}", path.chars().rev().take(22).collect::<String>().chars().rev().collect::<String>())
     } else {
         path
     };
-    let right = format!("{}{}{}{}", s.provider, g.sep(), path, g.sep());
-    let right_w = right.width() + dot.width() + 1;
     let model = match (&s.model, &app.inference) {
         (_, InferenceState::Loading { model, .. }) => model.clone(),
         (Some(m), _) => match &s.model_detail {
@@ -223,17 +245,45 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         (None, _) => "no model".into(),
     };
     let logo = format!(" {} ", g.logo_inline());
-    let room = (area.width as usize).saturating_sub(logo.width() + right_w + 3);
+    // Right-hand segments, most important first; dropped when space runs out.
+    let mut segs: Vec<(String, Style)> = vec![(s.provider.clone(), t.muted())];
+    if let Some((cpu, used, total, model_mem)) = app.stats {
+        let st = if cpu > 85.0 || used as f64 > total as f64 * 0.9 { t.warning() } else { t.muted() };
+        let mm = model_mem.map(|m| format!(" · model {}", gib(m))).unwrap_or_default();
+        segs.push((format!("cpu {cpu:.0}% · ram {}/{}{mm}", gib(used), gib(total)), st));
+    }
+    if let Some(w) = &app.weather {
+        segs.push((weather_text(w, g.unicode), t.secondary()));
+    }
+    segs.push((path, t.muted()));
+    let min_model = 18usize;
+    let mut budget = (area.width as usize).saturating_sub(logo.width() + 2 + min_model.min(model.width() + 1) + dot.width() + 2);
+    let sep = g.sep();
+    let mut shown: Vec<(String, Style)> = Vec::new();
+    for (i, (text, st)) in segs.into_iter().enumerate() {
+        let need = text.width() + sep.width();
+        if need <= budget || i == 0 {
+            budget = budget.saturating_sub(need);
+            shown.push((text, st));
+        }
+    }
+    let mut right: Vec<Span> = Vec::new();
+    for (text, st) in shown {
+        right.push(Span::styled(text, st));
+        right.push(Span::styled(sep.to_string(), t.border()));
+    }
+    right.push(Span::styled(format!("{dot} "), dot_style));
+    let r = Line::from(right);
+    let rw = r.width();
+    let room = (area.width as usize).saturating_sub(logo.width() + rw + 3);
     let line = Line::from(vec![
         Span::styled(logo, t.primary()),
         Span::styled(g.vbar().to_string(), t.border()),
         Span::styled(format!(" {}", truncate(&model, room)), t.text()),
     ]);
     f.render_widget(Paragraph::new(line).style(t.surface()), area);
-    let r = Line::from(vec![Span::styled(right, t.muted()), Span::styled(format!("{dot} "), dot_style)]);
-    let rw = r.width() as u16;
-    if rw < area.width {
-        f.render_widget(Paragraph::new(r).style(t.surface()), Rect::new(area.right() - rw, area.y, rw, 1));
+    if (rw as u16) < area.width {
+        f.render_widget(Paragraph::new(r).style(t.surface()), Rect::new(area.right() - rw as u16, area.y, rw as u16, 1));
     }
 }
 
@@ -411,6 +461,26 @@ fn render_entry(app: &App, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                         Span::styled(format!("… {} more lines · Ctrl+O", all.len() - shown.len()), t.muted()),
                     ]));
                 }
+            }
+        }
+        Entry::Summary(text) => {
+            out.push(Line::default());
+            out.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(format!("{} ", if g.unicode { "▤" } else { "#" }), t.secondary()),
+                Span::styled("Summary of earlier messages (compacted)".to_string(), t.secondary()),
+            ]));
+            let bar = [Span::raw("   "), Span::styled(format!("{} ", g.quote_bar()), t.border())];
+            let lines: Vec<&str> = text.lines().collect();
+            let limit = if app.show_details { usize::MAX } else { 6 };
+            for l in lines.iter().take(limit) {
+                out.extend(markdown::wrap(&[(l.to_string(), t.muted())], w, &bar, &bar));
+            }
+            if lines.len() > limit {
+                out.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(format!("… {} more lines · Ctrl+O", lines.len() - limit), t.muted()),
+                ]));
             }
         }
         Entry::Notice { level, text } => {
@@ -792,6 +862,32 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines),
         Rect::new(inner.x + 1, inner.y + 2, inner.width.saturating_sub(2), inner.height.saturating_sub(2)),
     );
+}
+
+fn draw_secret(f: &mut Frame, app: &App, area: Rect, provider: &str, len: usize) {
+    let t = &app.theme;
+    let g = app.glyphs;
+    let box_area = centered(area, 64, 9);
+    f.render_widget(Clear, box_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(g.border_double())
+        .border_style(t.border_focus())
+        .title(Span::styled(format!(" {provider} API key "), t.primary()))
+        .style(t.surface());
+    let inner = block.inner(box_area);
+    f.render_widget(block, box_area);
+    let dots = (if g.unicode { "•" } else { "*" }).repeat(len.min(inner.width.saturating_sub(4) as usize));
+    let lines = vec![
+        Line::default(),
+        Line::styled(" Paste or type the key. It is stored in the system keychain,", t.text()),
+        Line::styled(" never in config, history, sessions or logs.", t.text()),
+        Line::default(),
+        Line::from(vec![Span::styled(format!(" {} ", g.prompt()), t.primary()), Span::styled(dots, t.secondary())]),
+        Line::default(),
+        Line::styled(" Enter save · Esc cancel · Ctrl+U clear", t.muted()),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn diff_style(t: &Theme, line: &str) -> Style {

@@ -70,6 +70,12 @@ pub struct UiConfig {
     /// `auto`, `truecolor`, `256`, `16` or `mono`.
     pub color_depth: String,
     pub show_reasoning: bool,
+    /// Show CPU and memory use in the header.
+    pub system_stats: bool,
+    /// Place name for the header weather (Open-Meteo). Unset = off.
+    pub weather: Option<String>,
+    /// `celsius` or `fahrenheit`.
+    pub weather_units: String,
 }
 
 impl Default for UiConfig {
@@ -84,6 +90,9 @@ impl Default for UiConfig {
             glyphs: "auto".into(),
             color_depth: "auto".into(),
             show_reasoning: true,
+            system_stats: true,
+            weather: None,
+            weather_units: "celsius".into(),
         }
     }
 }
@@ -133,11 +142,13 @@ pub struct AgentConfig {
     pub default_mode: String,
     pub max_steps: u32,
     pub require_command_approval: bool,
+    /// Web access for the model (`web_fetch`): `ask`, `allow` or `off`.
+    pub web_access: String,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { default_mode: "chat".into(), max_steps: 30, require_command_approval: true }
+        Self { default_mode: "chat".into(), max_steps: 30, require_command_approval: true, web_access: "ask".into() }
     }
 }
 
@@ -159,11 +170,13 @@ impl Default for ModelsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SessionsConfig {
     pub autosave: bool,
+    /// Summarize older turns automatically when the context window fills.
+    pub auto_compact: bool,
 }
 
 impl Default for SessionsConfig {
     fn default() -> Self {
-        Self { autosave: true }
+        Self { autosave: true, auto_compact: true }
     }
 }
 
@@ -319,6 +332,14 @@ impl Config {
             warnings.push(format!("agent.default_mode '{}' unknown; using chat", self.agent.default_mode));
             self.agent.default_mode = d.agent.default_mode.clone();
         }
+        if !["ask", "allow", "off"].contains(&self.agent.web_access.as_str()) {
+            warnings.push(format!("agent.web_access '{}' must be ask, allow or off; using ask", self.agent.web_access));
+            self.agent.web_access = d.agent.web_access.clone();
+        }
+        if !["celsius", "fahrenheit"].contains(&self.ui.weather_units.as_str()) {
+            warnings.push("ui.weather_units must be celsius or fahrenheit; using celsius".into());
+            self.ui.weather_units = d.ui.weather_units.clone();
+        }
         if self.agent.max_steps == 0 || self.agent.max_steps > 500 {
             warnings.push("agent.max_steps must be within 1–500; using 30".into());
             self.agent.max_steps = d.agent.max_steps;
@@ -376,6 +397,9 @@ compact_mode = false
 glyphs = "auto"             # auto, unicode, ascii
 color_depth = "auto"        # auto, truecolor, 256, 16, mono
 show_reasoning = true
+system_stats = true         # CPU / memory in the header
+# weather = "Amsterdam"     # header weather via open-meteo.com (sends only this place name)
+weather_units = "celsius"   # celsius, fahrenheit
 
 [inference]
 provider = "local"          # local, ollama, openai, anthropic, compat
@@ -391,6 +415,7 @@ load_timeout_secs = 300
 default_mode = "chat"       # chat, plan, build
 max_steps = 30
 require_command_approval = true
+web_access = "ask"          # web_fetch tool and @https:// links: ask, allow, off
 
 [models]
 directory = "auto"
@@ -398,6 +423,7 @@ huggingface_token_env = "HF_TOKEN"
 
 [sessions]
 autosave = true
+auto_compact = true         # summarize older turns when the context fills
 
 [providers]
 ollama_url = "http://127.0.0.1:11434"

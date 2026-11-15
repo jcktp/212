@@ -11,11 +11,16 @@ mod agent;
 mod attach;
 mod chat;
 mod context;
+mod credentials;
 mod doctor;
+mod extras;
 mod local;
 mod modelops;
 pub mod permissions;
 mod providers_setup;
+mod sessions_ops;
+mod skills;
+mod web;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -34,6 +39,20 @@ pub use context::estimate_tokens;
 
 /// Work that finished in a background task and must update runtime state.
 enum Internal {
+    Compacted {
+        result: Result<String, String>,
+        upto: usize,
+        then_send: Option<String>,
+    },
+    /// Replace the content of the user message that started the turn (after @url ingestion).
+    UserContent {
+        index: usize,
+        content: String,
+    },
+    Weather(Option<String>),
+    SkillsInstalled {
+        result: Result<Vec<String>, String>,
+    },
     Loaded {
         id: String,
         result: Result<LlamaServer, String>,
@@ -73,6 +92,8 @@ enum PendingAction {
     OfferInstallBackend,
     ImportOllamaLocal(models::ollama::LocalOllamaModel),
     LoadModel(String),
+    RemoveModel(String),
+    DeleteSession(String),
     Permission { plan: Box<tools::Plan>, reply: tokio::sync::oneshot::Sender<permissions::Decision>, session_option: bool },
 }
 
@@ -110,6 +131,21 @@ pub struct Runtime {
     autoload: bool,
     /// "Allow for session" grants (tool grant keys).
     grants: HashSet<String>,
+    sessions: Option<sessions::SessionStore>,
+    session: Option<sessions::SessionMeta>,
+    /// Compacted summary of history no longer in `messages`.
+    summary: Option<String>,
+    skip_auto_compact: bool,
+    /// Index in `messages` of the current turn's user message.
+    turn_start: usize,
+    startup_warnings: Vec<String>,
+    resume: Option<Option<String>>,
+    skills: Vec<skills::Skill>,
+    active_skills: Vec<String>,
+    weather_task: Option<tokio::task::JoinHandle<()>>,
+    backend_pid: extras::BackendPid,
+    /// Load whatever finishes installing next (set by `UseModel`).
+    load_next_install: bool,
     /// Models already warned about missing tool support.
     warned_no_tools: HashSet<String>,
 }
@@ -121,6 +157,8 @@ pub struct RuntimeOptions {
     pub cwd: PathBuf,
     /// Load the configured default model automatically.
     pub autoload: bool,
+    /// Resume a session on start: `Some(None)` = latest in this project.
+    pub resume: Option<Option<String>>,
 }
 
 impl Runtime {
@@ -132,6 +170,19 @@ impl Runtime {
         let store = ModelStore::open(&models_dir).map_err(|e| format!("model store at {}: {e}", models_dir.display()))?;
         let (internal_tx, internal_rx) = mpsc::channel(64);
         let mode = AgentMode::parse(&opts.config.agent.default_mode).unwrap_or_default();
+        let mut startup_warnings = Vec::new();
+        let sessions = if opts.config.sessions.autosave {
+            match sessions::SessionStore::open(&opts.paths.sessions_db()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    startup_warnings.push(format!("Sessions will not be saved: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let skills = skills::discover(&opts.paths.config_dir.join("skills"), &opts.cwd);
         let backend = inference::backend::discover(opts.config.inference.server_path.as_deref(), &opts.paths.backends_dir());
         Ok(Self {
             provider_name: opts.config.inference.provider.clone(),
@@ -162,6 +213,18 @@ impl Runtime {
             cwd: opts.cwd,
             autoload: opts.autoload,
             grants: HashSet::new(),
+            sessions,
+            session: None,
+            summary: None,
+            skip_auto_compact: false,
+            turn_start: 0,
+            startup_warnings,
+            resume: opts.resume,
+            skills,
+            active_skills: Vec::new(),
+            weather_task: None,
+            backend_pid: Default::default(),
+            load_next_install: false,
             warned_no_tools: HashSet::new(),
         })
     }
@@ -192,6 +255,10 @@ impl Runtime {
     }
 
     async fn startup(&mut self, autoload: bool) {
+        for w in std::mem::take(&mut self.startup_warnings) {
+            self.notice(NoticeLevel::Warn, w).await;
+        }
+        self.start_background_tasks();
         let reaped = inference::server::reap_stale(&self.paths.run_dir());
         if reaped > 0 {
             self.notice(NoticeLevel::Info, format!("Stopped {reaped} inference process(es) left behind by a previous session.")).await;
@@ -216,9 +283,15 @@ impl Runtime {
             self.set_provider(&name, None).await;
         }
         self.snapshot().await;
+        if let Some(which) = self.resume.take() {
+            self.resume_session(which).await;
+        }
     }
 
     async fn shutdown(&mut self) {
+        if let Some(t) = self.weather_task.take() {
+            t.abort();
+        }
         if let Some(c) = self.generation.take() {
             c.cancel();
         }
@@ -304,11 +377,15 @@ impl Runtime {
                 }
                 self.messages.clear();
                 self.grants.clear();
+                self.session = None;
+                self.summary = None;
+                self.active_skills.clear();
                 self.context_used = 0;
                 self.emit(Event::Cleared).await;
                 self.snapshot().await;
             }
             Request::LoadModel { id } => self.load_model(&id).await,
+            Request::UseModel { spec } => self.use_model(&spec).await,
             Request::UnloadModel => self.unload().await,
             Request::ListModels => self.list_models().await,
             Request::ModelInfo { id } => self.model_info(&id).await,
@@ -327,6 +404,7 @@ impl Runtime {
             Request::SetProvider { provider, model } => self.set_provider(&provider, model).await,
             Request::SetMode(m) => {
                 self.mode = m;
+                self.sync_session_settings();
                 self.snapshot().await;
                 let text = match m {
                     AgentMode::Chat => "Mode: chat — conversation only; no file access or commands.",
@@ -350,6 +428,19 @@ impl Runtime {
             Request::Status => self.status().await,
             Request::Context => self.context_report().await,
             Request::InstallBackend => self.offer_backend_install().await,
+            Request::ListSessions { all } => self.list_sessions(all).await,
+            Request::ResumeSession { id } => self.resume_session(id).await,
+            Request::RenameSession { title } => self.rename_session(&title).await,
+            Request::DeleteSession { id } => self.delete_session(&id).await,
+            Request::SearchHistory { query } => self.search_history(&query).await,
+            Request::Export { format, path } => self.export(&format, path).await,
+            Request::Compact => self.compact(None).await,
+            Request::SetCredential { provider, secret } => self.set_credential(&provider, secret).await,
+            Request::RemoveCredential { provider } => self.remove_credential(&provider).await,
+            Request::SetWeather { location } => self.set_weather(location).await,
+            Request::ListSkills => self.list_skills().await,
+            Request::UseSkill { name } => self.use_skill(&name).await,
+            Request::InstallSkill { source } => self.install_skill(&source).await,
             Request::Shutdown => {}
         }
     }
@@ -363,6 +454,8 @@ impl Runtime {
             PendingAction::OfferInstallBackend if accepted => self.offer_backend_install().await,
             PendingAction::ImportOllamaLocal(m) if accepted => self.import_ollama_local(m).await,
             PendingAction::LoadModel(id) if accepted => self.load_model(&id).await,
+            PendingAction::RemoveModel(id) if accepted => self.remove_model_confirmed(&id).await,
+            PendingAction::DeleteSession(id) if accepted => self.delete_session_confirmed(&id).await,
             PendingAction::Permission { plan, reply, session_option } => {
                 let decision = match choice {
                     Some(0) => permissions::Decision::Allow,
@@ -390,6 +483,10 @@ impl Runtime {
                     self.messages.pop();
                 }
                 self.messages.extend(messages);
+                if !failed_empty {
+                    let from = self.turn_start;
+                    self.persist_turn(from).await;
+                }
                 if let Some(p) = prompt_tokens {
                     self.context_used = (p + completion_tokens) as u32;
                 }
@@ -405,6 +502,14 @@ impl Runtime {
                 self.snapshot().await;
             }
             Internal::Choice { action, title, body, options } => self.choice(action, title, body, options).await,
+            Internal::Compacted { result, upto, then_send } => self.on_compacted(result, upto, then_send).await,
+            Internal::UserContent { index, content } => {
+                if let Some(m) = self.messages.get_mut(index) {
+                    m.content = content;
+                }
+            }
+            Internal::Weather(w) => self.emit(Event::Weather(w)).await,
+            Internal::SkillsInstalled { result } => self.on_skills_installed(result).await,
         }
     }
 }

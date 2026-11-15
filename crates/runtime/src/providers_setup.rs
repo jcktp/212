@@ -10,8 +10,8 @@ use providers::openai::OpenAiCompatible;
 
 use crate::Runtime;
 
-fn key_from_env(var: &str) -> Option<String> {
-    std::env::var(var).ok().map(|k| k.trim().to_string()).filter(|k| !k.is_empty())
+fn key_for(provider: &str, var: &str) -> Option<String> {
+    crate::credentials::lookup(provider, var)
 }
 
 impl Runtime {
@@ -49,20 +49,20 @@ impl Runtime {
                 Arc::new(OpenAiCompatible::new("ollama", &format!("{}/v1", p.ollama_url.trim_end_matches('/')), None, "")),
                 model.or(p.ollama_model),
             )),
-            "openai" => match key_from_env(&p.openai_key_env) {
+            "openai" => match key_for("openai", &p.openai_key_env) {
                 Some(k) => Ok((
                     Arc::new(OpenAiCompatible::new("openai", &p.openai_url, Some(k), &p.openai_key_env)),
                     model.or(Some(p.openai_model)),
                 )),
-                None => Err(format!("Set {} in your environment to use OpenAI.", p.openai_key_env)),
+                None => Err(format!("No OpenAI key: run /key openai, or set {}.", p.openai_key_env)),
             },
-            "anthropic" => match key_from_env(&p.anthropic_key_env) {
+            "anthropic" => match key_for("anthropic", &p.anthropic_key_env) {
                 Some(k) => Ok((Arc::new(Anthropic::new(&p.anthropic_url, k, &p.anthropic_key_env)), model.or(Some(p.anthropic_model)))),
-                None => Err(format!("Set {} in your environment to use Anthropic.", p.anthropic_key_env)),
+                None => Err(format!("No Anthropic key: run /key anthropic, or set {}.", p.anthropic_key_env)),
             },
             "compat" => match &p.compat_url {
                 Some(url) => {
-                    let key = p.compat_key_env.as_deref().and_then(key_from_env);
+                    let key = key_for("compat", p.compat_key_env.as_deref().unwrap_or("TWO_ONE_TWO_COMPAT_KEY"));
                     Ok((
                         Arc::new(OpenAiCompatible::new("compat", url, key, p.compat_key_env.as_deref().unwrap_or(""))),
                         model.or(p.compat_model),
@@ -97,6 +97,7 @@ impl Runtime {
         self.model_name = model.clone();
         self.save_setting("inference", "provider", name.clone().into());
         self.emit(Event::Inference(InferenceState::Ready)).await;
+        self.sync_session_settings();
         self.snapshot().await;
         self.notice(NoticeLevel::Success, format!("Provider: {name} · model {}", model.unwrap_or_default())).await;
     }

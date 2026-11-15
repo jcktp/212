@@ -26,7 +26,14 @@ async fn start(mock: MockProvider) -> Harness {
     std::fs::create_dir_all(&cwd).unwrap();
     let (ev_tx, rx) = mpsc::channel(1024);
     let rt = Runtime::new(
-        RuntimeOptions { config_path: paths.config_file(), paths, config: config::Config::default(), cwd: cwd.clone(), autoload: false },
+        RuntimeOptions {
+            config_path: paths.config_file(),
+            paths,
+            config: config::Config::default(),
+            cwd: cwd.clone(),
+            autoload: false,
+            resume: None,
+        },
         ev_tx,
     )
     .unwrap()

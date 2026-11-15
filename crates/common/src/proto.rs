@@ -58,6 +58,11 @@ pub enum Request {
     LoadModel {
         id: String,
     },
+    /// Switch to a model by id or spec, importing or downloading it first if
+    /// needed (downloads still ask for confirmation).
+    UseModel {
+        spec: String,
+    },
     UnloadModel,
     ListModels,
     ModelInfo {
@@ -102,6 +107,51 @@ pub enum Request {
     Context,
     Recommend,
     InstallBackend,
+    /// Sessions in this project (`all` = every project).
+    ListSessions {
+        all: bool,
+    },
+    /// Resume a session by id (prefix); `None` = most recent in this project.
+    ResumeSession {
+        id: Option<String>,
+    },
+    RenameSession {
+        title: String,
+    },
+    DeleteSession {
+        id: String,
+    },
+    SearchHistory {
+        query: String,
+    },
+    /// `md` or `json`; optional output path.
+    Export {
+        format: String,
+        path: Option<String>,
+    },
+    /// Summarize older history to free context.
+    Compact,
+    /// Store an API key in the OS keychain.
+    SetCredential {
+        provider: String,
+        secret: String,
+    },
+    RemoveCredential {
+        provider: String,
+    },
+    /// Enable the header weather for a place name, or disable it.
+    SetWeather {
+        location: Option<String>,
+    },
+    ListSkills,
+    /// Activate a skill for this conversation.
+    UseSkill {
+        name: String,
+    },
+    /// Install skills from a git URL or a local folder.
+    InstallSkill {
+        source: String,
+    },
     Shutdown,
 }
 
@@ -154,6 +204,27 @@ pub struct ModelSummary {
     pub path: PathBuf,
     pub capabilities: Vec<String>,
     pub active: bool,
+    /// False for models that are available but not in the store yet.
+    pub installed: bool,
+    /// How to get it when not installed: `ollama:<name>` (on disk) or a download spec.
+    pub install_spec: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionItem {
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    pub current: bool,
+}
+
+/// A restored conversation entry for display.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscriptItem {
+    User(String),
+    Assistant { text: String, reasoning: Option<String> },
+    Tool { title: String, ok: bool, summary: String },
+    Summary(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +334,25 @@ pub enum Event {
     },
     /// The conversation was reset.
     Cleared,
+    /// A picker of sessions (from /sessions or /history).
+    SessionList {
+        title: String,
+        items: Vec<SessionItem>,
+    },
+    /// Replace the visible conversation with a restored transcript.
+    Transcript {
+        title: String,
+        items: Vec<TranscriptItem>,
+    },
+    /// System load for the header (sent every few seconds when enabled).
+    Stats {
+        cpu_percent: f32,
+        mem_used: u64,
+        mem_total: u64,
+        model_mem: Option<u64>,
+    },
+    /// Header weather text, or `None` when disabled/unavailable.
+    Weather(Option<String>),
     /// Runtime finished shutting down; the UI may exit.
     ShutdownComplete,
 }

@@ -24,6 +24,9 @@ disturbing your comments or formatting**.
 | `glyphs` | `"auto"` | `auto`, `unicode`, `ascii` |
 | `color_depth` | `"auto"` | `auto`, `truecolor`, `256`, `16`, `mono` (`NO_COLOR` forces `mono`) |
 | `show_reasoning` | `true` | expand model reasoning by default (toggle with Ctrl+O) |
+| `system_stats` | `true` | CPU and memory in the header (refreshed every 3 s; redraws only on change) |
+| `weather` | unset | place name for the header weather via open-meteo.com. Only the name is sent. `/weather` sets it. |
+| `weather_units` | `"celsius"` | `celsius` or `fahrenheit` |
 
 ### `[inference]`
 
@@ -47,6 +50,7 @@ disturbing your comments or formatting**.
 | --- | --- | --- |
 | `default_mode` | `"chat"` | `chat`, `plan`, `build` |
 | `max_steps` | `30` | 1 – 500. Model calls per user message before the agent stops and asks you to say "continue". |
+| `web_access` | `"ask"` | `ask` (per site, with a session option), `allow`, or `off` (no `web_fetch` tool, `@https://` links not fetched) |
 | `require_command_approval` | `true` | `false` runs non-risky commands without asking. Risky commands always ask, and edits always ask unless allowed for the session. |
 
 ### `[models]`
@@ -60,7 +64,8 @@ disturbing your comments or formatting**.
 
 | Key | Default | |
 | --- | --- | --- |
-| `autosave` | `true` | sessions milestone |
+| `autosave` | `true` | save conversations to `sessions.sqlite3` in the data directory |
+| `auto_compact` | `true` | summarize older turns when the context window fills |
 
 ### `[providers]`
 
@@ -72,8 +77,10 @@ disturbing your comments or formatting**.
 | `anthropic_url` / `anthropic_model` / `anthropic_key_env` | `https://api.anthropic.com` / `claude-sonnet-5-5` / `ANTHROPIC_API_KEY` |
 | `compat_url` / `compat_model` / `compat_key_env` | unset. Any OpenAI-compatible API root, e.g. `http://localhost:1234/v1`. |
 
-API keys are always read from the named environment variables. They are
-never stored in this file.
+API keys are read from the named environment variables first, then from the
+system keychain (service `212`, account `openai` / `anthropic` / `compat` /
+`huggingface`; set with `/key <provider>` or `212 key set <provider>`). They
+are never stored in this file.
 
 ## Environment variables
 

@@ -19,9 +19,15 @@ serde_json.workspace = true
 tracing.workspace = true
 toml_edit.workspace = true
 tools.workspace = true
+sessions.workspace = true
+ignore.workspace = true
+keyring.workspace = true
+sysinfo.workspace = true
+serde.workspace = true
 time.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+models.workspace = true
 common.workspace = true
 config.workspace = true

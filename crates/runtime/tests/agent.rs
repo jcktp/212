@@ -38,9 +38,12 @@ async fn start(turns: Vec<Vec<Result<StreamEvent, providers::ProviderError>>>, m
     let (ev_tx, rx) = mpsc::channel(1024);
     let mock = MockProvider::new(turns);
     let logs = paths.log_dir();
-    let rt = Runtime::new(RuntimeOptions { config_path: paths.config_file(), paths, config, cwd: ws.clone(), autoload: false }, ev_tx)
-        .unwrap()
-        .with_provider(Arc::new(mock.clone()), "mock");
+    let rt = Runtime::new(
+        RuntimeOptions { config_path: paths.config_file(), paths, config, cwd: ws.clone(), autoload: false, resume: None },
+        ev_tx,
+    )
+    .unwrap()
+    .with_provider(Arc::new(mock.clone()), "mock");
     let (tx, req_rx) = mpsc::channel(16);
     tokio::spawn(rt.run(req_rx, false));
     H { tx, rx, mock, ws, logs, _tmp: tmp }

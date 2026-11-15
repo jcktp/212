@@ -34,18 +34,37 @@ pub enum Policy {
 /// Tool kinds offered to the model in each mode.
 pub fn offered(mode: AgentMode) -> &'static [ToolKind] {
     match mode {
-        AgentMode::Chat => &[],
-        AgentMode::Plan => &[ToolKind::Read],
-        AgentMode::Build => &[ToolKind::Read, ToolKind::Write, ToolKind::Execute],
+        AgentMode::Chat => &[ToolKind::Network, ToolKind::Skill],
+        AgentMode::Plan => &[ToolKind::Read, ToolKind::Network, ToolKind::Skill],
+        AgentMode::Build => &[ToolKind::Read, ToolKind::Write, ToolKind::Execute, ToolKind::Network, ToolKind::Skill],
     }
 }
 
+/// Kinds actually offered given configuration (web access, installed skills).
+pub fn offered_with(mode: AgentMode, web_access: &str, have_skills: bool) -> Vec<ToolKind> {
+    offered(mode)
+        .iter()
+        .copied()
+        .filter(|k| !(*k == ToolKind::Network && web_access == "off") && !(*k == ToolKind::Skill && !have_skills))
+        .collect()
+}
+
 pub fn decide(mode: AgentMode, plan: &Plan, grants: &HashSet<String>, require_command_approval: bool) -> Policy {
+    decide_with(mode, plan, grants, require_command_approval, "ask")
+}
+
+pub fn decide_with(mode: AgentMode, plan: &Plan, grants: &HashSet<String>, require_command_approval: bool, web_access: &str) -> Policy {
     if !offered(mode).contains(&plan.kind) {
         return Policy::Deny(format!("{} is not allowed in {} mode", plan.tool, mode.as_str()));
     }
     match plan.kind {
-        ToolKind::Read => Policy::Allow,
+        ToolKind::Read | ToolKind::Skill => Policy::Allow,
+        ToolKind::Network => match web_access {
+            "off" => Policy::Deny("web access is turned off (agent.web_access)".into()),
+            "allow" => Policy::Allow,
+            _ if grants.contains(&plan.grant_key) => Policy::Allow,
+            _ => Policy::Ask { session_option: true },
+        },
         ToolKind::Write => {
             if grants.contains(&plan.grant_key) {
                 Policy::Allow
@@ -77,7 +96,7 @@ pub fn audit(path: &Path, tool: &str, title: &str, decision: &str, ok: Option<bo
 
 impl Runtime {
     pub(crate) async fn on_permission(&mut self, plan: Box<Plan>, reply: tokio::sync::oneshot::Sender<Decision>) {
-        match decide(self.mode, &plan, &self.grants, self.config.agent.require_command_approval) {
+        match decide_with(self.mode, &plan, &self.grants, self.config.agent.require_command_approval, &self.config.agent.web_access) {
             Policy::Allow => {
                 let _ = reply.send(Decision::Allow);
             }
@@ -91,12 +110,14 @@ impl Runtime {
                 }
                 body.push(match plan.kind {
                     ToolKind::Write => "The model wants to change this file:".to_string(),
+                    ToolKind::Network => "The model wants to read this web page (its content will be sent to the model):".to_string(),
                     _ => format!("The model wants to run this in {}:", self.cwd.display()),
                 });
                 let mut options = vec!["Allow once".to_string()];
                 if session_option {
                     options.push(match plan.kind {
                         ToolKind::Write => "Allow all edits this session".into(),
+                        ToolKind::Network => format!("Allow {} this session", plan.grant_key.trim_start_matches("web:")),
                         _ => "Always allow this command this session".into(),
                     });
                 }
@@ -148,6 +169,8 @@ mod tests {
             cancel: CancellationToken::new(),
             command_timeout: Duration::from_secs(5),
             scrub_env: vec![],
+            skills: vec![],
+            http: None,
         };
         tools::plan(tool, args, &ctx).unwrap()
     }
@@ -176,6 +199,15 @@ mod tests {
         assert_eq!(decide(Build, &edit, &grants, true), Policy::Allow);
         assert_eq!(decide(Build, &cmd, &grants, true), Policy::Allow);
         assert_eq!(decide(Build, &risky, &grants, true), Policy::Ask { session_option: false });
+        // Web: ask per site, allow/off by config, session grants per host.
+        let web = plan(tmp.path(), "web_fetch", r#"{"url":"https://docs.rs/x"}"#);
+        assert_eq!(decide_with(Chat, &web, &none, true, "ask"), Policy::Ask { session_option: true });
+        assert_eq!(decide_with(Chat, &web, &none, true, "allow"), Policy::Allow);
+        assert!(matches!(decide_with(Build, &web, &none, true, "off"), Policy::Deny(_)));
+        let host: HashSet<String> = ["web:docs.rs".to_string()].into();
+        assert_eq!(decide_with(Plan, &web, &host, true, "ask"), Policy::Allow);
+        assert_eq!(offered_with(Chat, "off", false), Vec::<ToolKind>::new());
+        assert_eq!(offered_with(Chat, "ask", true), vec![ToolKind::Network, ToolKind::Skill]);
         // A grant for one command doesn't cover another.
         let other = plan(tmp.path(), "run_command", r#"{"command":"ls -la"}"#);
         assert_eq!(decide(Build, &other, &grants, true), Policy::Ask { session_option: true });

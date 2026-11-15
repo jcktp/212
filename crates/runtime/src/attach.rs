@@ -54,6 +54,9 @@ pub fn expand(text: &str, root: &Path) -> (String, Vec<Outcome>) {
     let mut seen = Vec::new();
     for tok in text.split_whitespace() {
         let Some(rel) = tok.strip_prefix('@') else { continue };
+        if rel.starts_with("http://") || rel.starts_with("https://") {
+            continue; // links are fetched by the agent (see web.rs)
+        }
         let rel = rel.trim_end_matches([',', '.', ';', ':', ')', '?', '!']);
         if rel.is_empty() || seen.contains(&rel.to_string()) {
             continue;

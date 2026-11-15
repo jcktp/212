@@ -20,8 +20,8 @@ required. Cloud providers (OpenAI, Anthropic, any OpenAI-compatible endpoint)
 are optional.
 
 > Status: early development (v0.1). Local chat, model management, providers,
-> the terminal UI and the coding agent (read, search, edit, run commands and
-> tests, with approval) work today. Persistent sessions are next; see
+> the coding agent (read, search, edit, run commands and tests, with
+> approval), saved sessions, web links and Agent Skills work today; see
 > [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Install
@@ -100,7 +100,7 @@ inside the working directory can be attached. Files that look like secrets
 
 | Command | |
 | --- | --- |
-| `/models` | installed models (Enter load · `i` info · `Del` remove) |
+| `/models` | one list of installed models, models already on disk (Ollama) and recommended downloads. Enter switches to any of them, importing or downloading first (downloads ask). `i` info · `Ctrl+D` remove (asks) |
 | `/models search <q>` · `pull <spec>` · `import <path\|ollama[:name]>` · `remove` · `info` · `switch` · `cancel` | model management |
 | `/recommend` | models suited to this machine |
 | `/provider [local\|ollama\|openai\|anthropic\|compat] [model]` | switch provider without restarting |
@@ -108,6 +108,13 @@ inside the working directory can be attached. Files that look like secrets
 | `/animations on\|reduced\|off` | animation level |
 | `/mode chat\|plan\|build` | agent mode (see below) |
 | `/new` · `/clear` | new conversation · clear the view |
+| `/sessions [all]` · `/resume [id]` · `/rename <title>` | browse, resume and name saved conversations (`212 -c` continues the last one) |
+| `/history <words>` | full-text search across all saved conversations |
+| `/export [md\|json] [path]` | write the conversation to a file |
+| `/compact` | summarize older messages to free context (also automatic when the window fills) |
+| `/key <provider>` · `/key remove <provider>` | store an API key in the system keychain (masked input, never in history) |
+| `/skills [add <git URL\|owner/repo\|folder>]` · `/skill <name>` | list or install Agent Skills · activate one |
+| `/weather <place>\|off` | weather in the header (opt-in, via open-meteo.com) |
 | `/context` · `/status` · `/doctor` | context usage · runtime status · diagnostics |
 | `/copy [code]` | copy the last reply or its last code block (OSC 52, works over SSH) |
 | `/unload` | stop the local model and free its memory |
@@ -139,6 +146,42 @@ or see your API keys (they are removed from command environments). Commands
 run with your user's permissions. There is no OS-level sandbox, so read the
 command before you allow it. Every tool call is logged to `logs/audit.jsonl`.
 
+### Sessions
+
+Every conversation is saved automatically to a local SQLite database, grouped
+by the directory you started 212 in. Resume the last one with `212 -c` (or
+`/resume`), browse with `/sessions`, search everything with `/history`, and
+export to Markdown or JSON with `/export`. When the context window fills, older
+turns are summarized automatically (`/compact` does it on demand). The full
+transcript always stays in the database. Set `sessions.autosave = false` to
+keep nothing.
+
+### Links and the web
+
+Put `@` before a link to include the page in your message:
+`summarize @https://example.com/post`. The model can also read pages itself
+with the `web_fetch` tool (in every mode). By default it asks first, per site,
+with "allow this site for the session". Pages are converted to text. Local and
+private-network addresses are refused. Set `agent.web_access` to `allow` or
+`off`.
+
+### Skills
+
+212 supports the open **Agent Skills** format: a folder with a `SKILL.md`
+whose frontmatter has `name` and `description`, plus optional scripts and
+references. Install with `/skills add owner/repo`, a git URL or a local folder.
+Skills are also picked up from `.agents/skills/`, `.claude/skills/` and
+`.212/skills/` in your project. The model sees each skill's name and
+description and loads the full instructions with `load_skill` when relevant.
+`/skill <name>` forces one on for the conversation. Installing never runs code,
+and scripts a skill mentions still need your approval in build mode.
+
+### Header
+
+The top line shows the model, provider, CPU and memory (with the model
+server's share) and, if you turn it on with `/weather <place>`, the current
+weather. Disable the stats with `ui.system_stats = false`.
+
 ### Themes
 
 `phosphor` · `amber` · `dos` · `arcade` · `gameboy` · `cyber` · `paper` · `monochrome`
@@ -158,8 +201,10 @@ automatically (`NO_COLOR` is respected). Custom themes are TOML files; see
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `compat` | `providers.compat_url` (LM Studio, vLLM, a remote llama-server…) |
 
-API keys are read from environment variables and never written to logs or the
-config file.
+API keys come from environment variables or the system keychain (`/key
+anthropic`, or `212 key set anthropic`). They are never written to logs, the
+config file or saved sessions, and they are removed from the environment of
+commands the agent runs.
 
 ## Where things live
 
@@ -189,8 +234,9 @@ hard link from elsewhere (e.g. Ollama) keep their original copy.
 
 Everything runs locally by default. The local backend listens on `127.0.0.1`
 only, on a random port, behind a random per-session API key. 212 makes network
-requests only when you search, download, install the backend, or choose a
-cloud provider.
+requests only when you search, download, install the backend or a skill, use a
+cloud provider, include or approve a web link, or enable the header weather
+(which sends only the place name to open-meteo.com).
 
 ## Documentation
 

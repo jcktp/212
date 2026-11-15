@@ -110,10 +110,11 @@ pub async fn run(job: Job, yes: bool, tx: mpsc::Sender<Request>, mut rx: mpsc::R
                 }
             }
             Event::Models(list) => {
-                if list.is_empty() {
+                let (installed, available): (Vec<_>, Vec<_>) = list.into_iter().partition(|m| m.installed);
+                if installed.is_empty() {
                     writeln!(out, "No models installed.")?;
                 }
-                for m in list {
+                for m in &installed {
                     writeln!(
                         out,
                         "{}{:<36} {:<8} {:>9}  {}  {}",
@@ -125,12 +126,25 @@ pub async fn run(job: Job, yes: bool, tx: mpsc::Sender<Request>, mut rx: mpsc::R
                         m.source
                     )?;
                 }
+                if !available.is_empty() {
+                    writeln!(out, "\nAvailable (212 models pull <spec>):")?;
+                    for m in &available {
+                        writeln!(out, "  {:<44} {}", m.install_spec.as_deref().unwrap_or(&m.id), m.source)?;
+                    }
+                }
                 break;
             }
             Event::SearchResults { query, hits } => {
                 writeln!(out, "{query}:")?;
                 for h in hits {
                     writeln!(out, "  {:<48} {}", h.spec, h.detail)?;
+                }
+                break;
+            }
+            Event::SessionList { title, items } => {
+                writeln!(out, "{title}:")?;
+                for i in items {
+                    writeln!(out, "  {}{:<16} {:<44} {}", if i.current { "* " } else { "  " }, i.id, i.title, i.detail)?;
                 }
                 break;
             }
