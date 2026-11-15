@@ -13,6 +13,7 @@ config = { package = "two-one-two-config", path = "crates/config" }
 inference = { package = "two-one-two-inference", path = "crates/inference" }
 models = { package = "two-one-two-models", path = "crates/models" }
 providers = { package = "two-one-two-providers", path = "crates/providers" }
+tools = { package = "two-one-two-tools", path = "crates/tools" }
 runtime = { package = "two-one-two-runtime", path = "crates/runtime" }
 tui = { package = "two-one-two-tui", path = "crates/tui" }
 
@@ -42,6 +43,9 @@ tempfile = "3"
 rand = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 ignore = "0.4"
+similar = "2"
+regex = "1"
+globset = "0.4"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 
 [profile.release]

@@ -10,10 +10,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use crate::anim::{self, Style as Anim};
-use crate::app::{App, Boot, Entry, Overlay};
+use crate::app::{App, Boot, Entry, Overlay, ToolStatus};
 use crate::art;
 use crate::commands::COMMANDS;
 use crate::markdown::{self, Ctx};
+use crate::theme::Theme;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -97,6 +98,34 @@ fn truncate(s: &str, w: usize) -> String {
     out
 }
 
+/// Remove chat-template control tokens (e.g. `<|channel>thought`) that some
+/// models leak into their reasoning text.
+pub fn strip_control_tokens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let end = tail.find('>').filter(|e| *e < 40);
+        match end {
+            Some(e) if tail[..=e].contains('|') && !tail[1..e].contains(' ') => {
+                rest = &tail[e + 1..];
+                // Drop a role word glued to the token (`thought`, `analysis`).
+                let word: usize = rest.chars().take_while(|c| c.is_ascii_alphabetic()).map(|c| c.len_utf8()).sum();
+                if matches!(&rest[..word], "thought" | "analysis" | "final" | "commentary") {
+                    rest = &rest[word..];
+                }
+            }
+            _ => {
+                out.push('<');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn short_path(p: &str) -> String {
     if let Some(home) = std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned())
         && let Some(rest) = p.strip_prefix(&home)
@@ -177,7 +206,13 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let g = app.glyphs;
     let s = &app.snapshot;
     let (dot, dot_style) = status_dot(app);
-    let right = format!("{}{}{}{}", s.provider, g.sep(), short_path(&s.cwd), g.sep());
+    let path = short_path(&s.cwd);
+    let path = if path.width() > 28 {
+        format!("…{}", path.chars().rev().take(26).collect::<String>().chars().rev().collect::<String>())
+    } else {
+        path
+    };
+    let right = format!("{}{}{}{}", s.provider, g.sep(), path, g.sep());
     let right_w = right.width() + dot.width() + 1;
     let model = match (&s.model, &app.inference) {
         (_, InferenceState::Loading { model, .. }) => model.clone(),
@@ -279,12 +314,14 @@ fn render_entry(app: &App, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             let mark = vec![Span::styled(format!(" {} ", g.user_mark()), t.user())];
             out.extend(markdown::plain(text, w, t.user().add_modifier(Modifier::BOLD), &mark, &mark));
         }
-        Entry::Assistant { text, reasoning, streaming, stats, show_reasoning, model } => {
-            out.push(Line::default());
-            out.push(Line::from(vec![
-                Span::styled(format!(" {} ", g.assistant_mark()), t.primary()),
-                Span::styled(if model.is_empty() { "212".to_string() } else { model.clone() }, t.muted()),
-            ]));
+        Entry::Assistant { text, reasoning, streaming, stats, show_reasoning, model, continuation } => {
+            if !*continuation {
+                out.push(Line::default());
+                out.push(Line::from(vec![
+                    Span::styled(format!(" {} ", g.assistant_mark()), t.primary()),
+                    Span::styled(if model.is_empty() { "212".to_string() } else { model.clone() }, t.muted()),
+                ]));
+            }
             let indent = [Span::raw("   ")];
             if !reasoning.is_empty() {
                 let thinking_live = *streaming && text.is_empty();
@@ -293,10 +330,11 @@ fn render_entry(app: &App, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                     let bar = [Span::raw("   "), Span::styled(format!("{} ", g.quote_bar()), t.border())];
                     let shown: String = if thinking_live && !*show_reasoning {
                         // Show only the tail while it streams.
-                        let lines: Vec<&str> = reasoning.lines().collect();
+                        let clean = strip_control_tokens(reasoning);
+                        let lines: Vec<&str> = clean.trim().lines().collect();
                         lines[lines.len().saturating_sub(4)..].join("\n")
                     } else {
-                        reasoning.trim().to_string()
+                        strip_control_tokens(reasoning).trim().to_string()
                     };
                     out.push(Line::from(vec![
                         Span::raw("   "),
@@ -324,6 +362,55 @@ fn render_entry(app: &App, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             }
             if let Some(s) = stats {
                 out.push(Line::from(vec![Span::raw("   "), Span::styled(format!("{} {s}", g.hrule()), t.muted())]));
+            }
+        }
+        Entry::Tool { tool, title, status, summary, detail, .. } => {
+            let (icon, st) = match status {
+                ToolStatus::Running => (app.anim.frame(Anim::Spinner, app.activity_elapsed(), 1), t.tool()),
+                ToolStatus::Ok => (g.check().to_string(), t.success()),
+                ToolStatus::Failed => (g.cross().to_string(), t.error()),
+            };
+            let mut first = vec![Span::raw("   "), Span::styled(format!("{icon} "), st)];
+            first.push(Span::styled(title.clone(), t.tool()));
+            if !summary.is_empty() {
+                first.push(Span::styled(format!(" · {summary}"), if *status == ToolStatus::Failed { t.error() } else { t.muted() }));
+            }
+            let first_w: usize = first.iter().map(|s| s.content.width()).sum();
+            if first_w > w {
+                out.extend(markdown::wrap(&[(format!("{title} · {summary}"), t.tool())], w, &first[..2], &[Span::raw("     ")]));
+            } else {
+                out.push(Line::from(first));
+            }
+            if let Some(d) = detail {
+                let is_diff = matches!(tool.as_str(), "edit_file" | "write_file");
+                let limit = if app.show_details {
+                    usize::MAX
+                } else if is_diff {
+                    12
+                } else {
+                    6
+                };
+                let all: Vec<&str> = d.lines().filter(|l| !(is_diff && (l.starts_with("---") || l.starts_with("+++")))).collect();
+                // Command output: show the tail; diffs: show the head.
+                let shown: Vec<&str> =
+                    if is_diff { all.iter().take(limit).copied().collect() } else { all[all.len().saturating_sub(limit)..].to_vec() };
+                let bar = [Span::raw("     "), Span::styled(format!("{} ", g.vbar()), t.border())];
+                if !is_diff && all.len() > shown.len() {
+                    out.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled(format!("… {} earlier lines · Ctrl+O", all.len() - shown.len()), t.muted()),
+                    ]));
+                }
+                for l in &shown {
+                    let style = if is_diff { diff_style(t, l) } else { t.muted() };
+                    out.extend(markdown::wrap(&[(l.to_string(), style)], w, &bar, &bar));
+                }
+                if is_diff && all.len() > shown.len() {
+                    out.push(Line::from(vec![
+                        Span::raw("     "),
+                        Span::styled(format!("… {} more lines · Ctrl+O", all.len() - shown.len()), t.muted()),
+                    ]));
+                }
             }
         }
         Entry::Notice { level, text } => {
@@ -371,7 +458,8 @@ fn draw_conversation(f: &mut Frame, app: &mut App, area: Rect) {
     let mut stale: Vec<usize> = Vec::new();
     for (i, e) in app.entries.iter().enumerate() {
         let ok = matches!(&e.cache, Some((w, tg, v, _)) if *w == width && *tg == theme_gen && *v == e.version);
-        let animated = matches!(&e.entry, Entry::Assistant { streaming: true, .. });
+        let animated =
+            matches!(&e.entry, Entry::Assistant { streaming: true, .. } | Entry::Tool { status: crate::app::ToolStatus::Running, .. });
         if !ok || animated {
             stale.push(i);
         }
@@ -488,6 +576,27 @@ fn draw_activity(f: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled(app.anim.frame(Anim::Bar, el, 14), t.progress()));
                 spans.push(Span::styled(format!(" loading {model} "), t.text()));
                 spans.push(Span::styled(format!("· {detail} · {}s · Esc cancel", el.as_secs()), t.muted()));
+            }
+            InferenceState::Generating if matches!(app.overlay, Overlay::Choice(_)) => {
+                spans.push(Span::styled(app.anim.frame(Anim::Pulse, el, 1), t.warning()));
+                spans.push(Span::styled(" waiting for your approval".to_string(), t.warning()));
+            }
+            InferenceState::Generating if app.current_tool.is_some() => {
+                let (tool, title) = app.current_tool.clone().unwrap_or_default();
+                let label = match tool.as_str() {
+                    "read_file" => "reading",
+                    "list_dir" | "find_files" | "project_info" => "exploring",
+                    "grep" => "searching",
+                    "git_status" | "git_diff" | "git_log" => "checking git",
+                    "edit_file" | "write_file" => "editing",
+                    "run_tests" => "running tests",
+                    "run_command" => "running",
+                    _ => "working",
+                };
+                let frame = if tool.starts_with("run_") { app.anim.frame(Anim::Scan, el, 4) } else { app.anim.frame(Anim::Spinner, el, 1) };
+                spans.push(Span::styled(frame, t.tool()));
+                spans.push(Span::styled(format!(" {label} "), t.text()));
+                spans.push(Span::styled(format!("{} · Esc stop", truncate(&title, w.saturating_sub(30))), t.muted()));
             }
             InferenceState::Generating => {
                 let thinking = matches!(app.entries.last().map(|e| &e.entry), Some(Entry::Assistant { text, reasoning, .. }) if text.is_empty() && !reasoning.is_empty());
@@ -685,40 +794,91 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn diff_style(t: &Theme, line: &str) -> Style {
+    if line.starts_with('+') {
+        t.success()
+    } else if line.starts_with('-') {
+        t.error()
+    } else if line.starts_with("@@") {
+        t.secondary()
+    } else {
+        t.muted()
+    }
+}
+
 fn draw_choice(f: &mut Frame, app: &App, area: Rect) {
     let Overlay::Choice(c) = &app.overlay else { return };
     let t = &app.theme;
     let g = app.glyphs;
-    let body_w = c.body.iter().map(|l| l.width()).max().unwrap_or(20).max(c.title.width() + 4).min(90) as u16;
+    let preview: Vec<&str> = c.preview.as_deref().map(|p| p.lines().collect()).unwrap_or_default();
+    let content_w = c
+        .body
+        .iter()
+        .chain(preview.iter().map(|_| &c.title))
+        .map(|l| l.width())
+        .chain(preview.iter().map(|l| l.width()))
+        .max()
+        .unwrap_or(20)
+        .max(c.title.width() + 4)
+        .max(c.options.iter().map(|o| o.width() + 6).sum::<usize>())
+        .min(110) as u16;
     let art_lines: &[&str] =
         if app.ui.ascii_art && c.title.to_lowercase().contains("download") { art::FLOPPY.lines(g.unicode) } else { &[] };
-    let h = c.body.len() as u16 + art_lines.len() as u16 + 6;
-    let box_area = centered(area, body_w + 6, h);
+    // Fit the preview into the screen; the rest is summarized.
+    let fixed = c.body.len() + art_lines.len() + 6;
+    let room = (area.height as usize).saturating_sub(fixed + 4).max(3);
+    let shown = preview.len().min(room);
+    let h = (fixed + shown + if preview.len() > shown { 1 } else { 0 } + if preview.is_empty() { 0 } else { 1 }) as u16;
+    let box_area = centered(area, content_w + 6, h);
     f.render_widget(Clear, box_area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_set(g.border_double())
         .border_style(t.border_focus())
-        .title(Span::styled(format!(" {} ", c.title), t.primary()))
+        .title(Span::styled(format!(" {} ", truncate(&c.title, box_area.width.saturating_sub(6) as usize)), t.primary()))
         .style(t.surface());
     let inner = block.inner(box_area);
     f.render_widget(block, box_area);
+    let iw = inner.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
     for a in art_lines {
         lines.push(Line::styled(format!(" {a}"), t.secondary()));
     }
     lines.push(Line::default());
     for b in &c.body {
-        lines.push(Line::styled(format!(" {}", truncate(b, inner.width.saturating_sub(2) as usize)), t.text()));
+        let st = if b.starts_with('⚠') { t.warning() } else { t.text() };
+        lines.push(Line::styled(format!(" {}", truncate(b, iw)), st));
+    }
+    if !preview.is_empty() {
+        lines.push(Line::default());
+        for l in preview.iter().take(shown) {
+            let st = if l.starts_with("$ ") { t.secondary().add_modifier(Modifier::BOLD) } else { diff_style(t, l) };
+            lines.push(Line::styled(format!(" {}", truncate(l, iw)), st));
+        }
+        if preview.len() > shown {
+            lines.push(Line::styled(format!(" … {} more lines", preview.len() - shown), t.muted()));
+        }
     }
     lines.push(Line::default());
     let mut buttons: Vec<Span> = vec![Span::raw(" ")];
     for (i, o) in c.options.iter().enumerate() {
         let st = if i == c.selected { t.selected() } else { t.secondary() };
-        buttons.push(Span::styled(format!("[ {o} ]"), st));
-        buttons.push(Span::raw("  "));
+        buttons.push(Span::styled(format!("[ {} {o} ]", i + 1), st));
+        buttons.push(Span::raw(" "));
     }
     lines.push(Line::from(buttons));
-    lines.push(Line::styled(" ←→ choose · Enter confirm · Esc cancel", t.muted()));
+    lines.push(Line::styled(" ←→ choose · Enter confirm · 1-9 pick · Esc deny/cancel", t.muted()));
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_control_tokens;
+
+    #[test]
+    fn strips_template_tokens_only() {
+        assert_eq!(strip_control_tokens("<|channel>thought\nOkay, a < b and <div>"), "\nOkay, a < b and <div>");
+        assert_eq!(strip_control_tokens("x<|end|>y"), "xy");
+        assert_eq!(strip_control_tokens("Vec<T> is fine"), "Vec<T> is fine");
+    }
 }

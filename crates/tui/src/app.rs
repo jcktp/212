@@ -29,14 +29,45 @@ pub struct TuiOptions {
     pub keyboard_enhanced: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    Running,
+    Ok,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub enum Entry {
     Welcome,
     Help,
     User(String),
-    Assistant { text: String, reasoning: String, streaming: bool, stats: Option<String>, show_reasoning: bool, model: String },
-    Notice { level: NoticeLevel, text: String },
-    Report { title: String, art: Option<&'static str>, lines: Vec<ReportLine> },
+    Assistant {
+        text: String,
+        reasoning: String,
+        streaming: bool,
+        stats: Option<String>,
+        show_reasoning: bool,
+        model: String,
+        /// Continues the same turn after tool calls (no header).
+        continuation: bool,
+    },
+    Tool {
+        id: String,
+        tool: String,
+        title: String,
+        status: ToolStatus,
+        summary: String,
+        detail: Option<String>,
+    },
+    Notice {
+        level: NoticeLevel,
+        text: String,
+    },
+    Report {
+        title: String,
+        art: Option<&'static str>,
+        lines: Vec<ReportLine>,
+    },
 }
 
 pub struct EntryBox {
@@ -93,6 +124,7 @@ pub struct ChoiceDialog {
     pub title: String,
     pub body: Vec<String>,
     pub options: Vec<String>,
+    pub preview: Option<String>,
     pub selected: usize,
 }
 
@@ -155,6 +187,10 @@ pub struct App {
     pub toast: Option<(String, Instant)>,
     pub config_path: PathBuf,
     pub keyboard_enhanced: bool,
+    /// Show full tool output, diffs and reasoning (Ctrl+O).
+    pub show_details: bool,
+    /// The tool currently running, for the activity line.
+    pub current_tool: Option<(String, String)>,
     onboarding: Onboarding,
     files: Option<Vec<String>>,
     cwd: PathBuf,
@@ -203,6 +239,8 @@ impl App {
             toast: None,
             config_path: opts.config_path,
             keyboard_enhanced: opts.keyboard_enhanced,
+            show_details: false,
+            current_tool: None,
             onboarding: if opts.first_run { Onboarding::Theme } else { Onboarding::Off },
             files: None,
             cwd: opts.cwd,
@@ -339,10 +377,26 @@ impl App {
                     stats: None,
                     show_reasoning: self.ui.show_reasoning,
                     model,
+                    continuation: false,
                 });
                 self.scroll = 0;
             }
             Event::Delta(d) => {
+                if matches!(d, StreamEvent::Text(_) | StreamEvent::Reasoning(_))
+                    && !matches!(self.entries.last().map(|e| &e.entry), Some(Entry::Assistant { streaming: true, .. }))
+                {
+                    // Text after tool calls continues the same turn.
+                    let model = self.snapshot.model.clone().unwrap_or_default();
+                    self.push(Entry::Assistant {
+                        text: String::new(),
+                        reasoning: String::new(),
+                        streaming: true,
+                        stats: None,
+                        show_reasoning: self.ui.show_reasoning || self.show_details,
+                        model,
+                        continuation: true,
+                    });
+                }
                 match d {
                     StreamEvent::Text(t) => {
                         self.streamed_tokens += 1;
@@ -365,7 +419,23 @@ impl App {
                 if tokens_per_second.is_some() {
                     self.last_speed = tokens_per_second;
                 }
-                let idx = self.entries.iter().rposition(|e| matches!(e.entry, Entry::Assistant { .. }));
+                self.current_tool = None;
+                // Close every streaming segment; drop empty ones.
+                self.entries.retain(|e| {
+                    !matches!(&e.entry, Entry::Assistant { streaming: true, text, reasoning, continuation: true, .. } if text.is_empty() && reasoning.is_empty())
+                });
+                for e in self.entries.iter_mut() {
+                    if let Entry::Assistant { streaming, .. } = &mut e.entry {
+                        *streaming = false;
+                    }
+                    if let Entry::Tool { status, summary, .. } = &mut e.entry
+                        && *status == ToolStatus::Running
+                    {
+                        *status = ToolStatus::Failed;
+                        *summary = "cancelled".into();
+                    }
+                }
+                let idx = self.entries.iter().rposition(|e| matches!(e.entry, Entry::Assistant { .. } | Entry::Tool { .. }));
                 if let Some(EntryBox { entry: Entry::Assistant { streaming, stats, text, reasoning, .. }, .. }) =
                     idx.map(|i| &mut self.entries[i])
                 {
@@ -380,7 +450,14 @@ impl App {
                     if text.is_empty() && reasoning.is_empty() {
                         self.entries.remove(idx.unwrap());
                     }
+                } else if let Some(i) = idx {
+                    // The turn ended on a tool call (e.g. cancelled): stats as a note.
+                    let speed = tokens_per_second.map(|t| format!(" · {t:.1} tok/s")).unwrap_or_default();
+                    let what = if cancelled { "stopped · " } else { "" };
+                    let _ = i;
+                    self.notice(NoticeLevel::Info, format!("{what}{completion_tokens} tok{speed} · {:.1}s", elapsed_ms as f64 / 1000.0));
                 }
+                self.theme_gen += 1; // re-render finished segments
                 self.touch_last();
             }
             Event::Notice { level, text } => self.notice(level, text),
@@ -398,8 +475,30 @@ impl App {
                 }
             }
             Event::Report { title, art, lines } => self.push(Entry::Report { title, art, lines }),
-            Event::Choice { id, title, body, options } => {
-                self.overlay = Overlay::Choice(ChoiceDialog { id, title, body, options, selected: 0 });
+            Event::Choice { id, title, body, options, preview } => {
+                self.overlay = Overlay::Choice(ChoiceDialog { id, title, body, options, preview, selected: 0 });
+            }
+            Event::Dismiss { id } => {
+                if matches!(&self.overlay, Overlay::Choice(c) if c.id == id) {
+                    self.overlay = Overlay::None;
+                }
+            }
+            Event::ToolStart { id, tool, title } => {
+                self.current_tool = Some((tool.clone(), title.clone()));
+                self.push(Entry::Tool { id, tool, title, status: ToolStatus::Running, summary: String::new(), detail: None });
+                self.scroll = 0;
+            }
+            Event::ToolEnd { id, ok, summary: sum, detail: det } => {
+                self.current_tool = None;
+                if let Some(i) = self.entries.iter().rposition(|e| matches!(&e.entry, Entry::Tool { id: x, .. } if *x == id)) {
+                    if let Entry::Tool { status, summary, detail, .. } = &mut self.entries[i].entry {
+                        *status = if ok { ToolStatus::Ok } else { ToolStatus::Failed };
+                        *summary = sum;
+                        *detail = det;
+                    }
+                    self.next_version += 1;
+                    self.entries[i].version = self.next_version;
+                }
             }
             Event::Cleared => {
                 self.entries.clear();
@@ -592,15 +691,17 @@ impl App {
         }
     }
 
+    /// Ctrl+O: expand/collapse reasoning, diffs and command output everywhere.
     fn toggle_reasoning(&mut self) {
-        if let Some(i) = self.entries.iter().rposition(|e| matches!(&e.entry, Entry::Assistant { reasoning, .. } if !reasoning.is_empty()))
-        {
-            if let Entry::Assistant { show_reasoning, .. } = &mut self.entries[i].entry {
-                *show_reasoning = !*show_reasoning;
+        self.show_details = !self.show_details;
+        let show = self.show_details;
+        for e in self.entries.iter_mut() {
+            if let Entry::Assistant { show_reasoning, .. } = &mut e.entry {
+                *show_reasoning = show;
             }
-            self.next_version += 1;
-            self.entries[i].version = self.next_version;
         }
+        self.theme_gen += 1; // invalidate render caches
+        self.toast(if show { "Details expanded".into() } else { "Details collapsed".into() });
     }
 
     fn close_overlay(&mut self, cancelled: bool) {

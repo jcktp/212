@@ -18,6 +18,8 @@ reqwest.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 toml_edit.workspace = true
+tools.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

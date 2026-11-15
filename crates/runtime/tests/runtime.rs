@@ -105,7 +105,7 @@ async fn cancel_stops_generation_and_keeps_partial_text() {
 
 #[tokio::test]
 async fn provider_error_is_reported_and_failed_turn_not_duplicated() {
-    let err = ProviderError::Connect { endpoint: "x".into(), message: "refused".into() };
+    let err = ProviderError::Http { provider: "mock".into(), status: 500, message: "refused".into() };
     let mut h = start(MockProvider::new(vec![vec![Err(err)], vec![Ok(StreamEvent::Text("ok".into()))]])).await;
     h.tx.send(Request::Send { text: "first".into() }).await.unwrap();
     let ev = until(&mut h.rx, |e| matches!(e, Event::TurnEnd { .. })).await;
@@ -167,4 +167,14 @@ async fn unknown_model_and_bad_import_report_errors() {
     assert!(matches!(ev.last(), Some(Event::Notice { text, .. }) if text.contains("no installed model")));
     h.tx.send(Request::ImportModel { source: "/definitely/not/here.gguf".into() }).await.unwrap();
     until(&mut h.rx, |e| matches!(e, Event::Notice { level: NoticeLevel::Error, .. })).await;
+}
+
+#[tokio::test]
+async fn connection_errors_are_retried_once_output_is_empty() {
+    let err = ProviderError::Connect { endpoint: "x".into(), message: "reset".into() };
+    let mut h = start(MockProvider::new(vec![vec![Err(err)], vec![Ok(StreamEvent::Text("recovered".into()))]])).await;
+    h.tx.send(Request::Send { text: "hi".into() }).await.unwrap();
+    let ev = until(&mut h.rx, |e| matches!(e, Event::TurnEnd { .. })).await;
+    assert_eq!(text_of(&ev), "recovered");
+    assert!(!ev.iter().any(|e| matches!(e, Event::Notice { level: NoticeLevel::Error, .. })));
 }

@@ -150,12 +150,20 @@ pub async fn run(job: Job, yes: bool, tx: mpsc::Sender<Request>, mut rx: mpsc::R
                 }
                 break;
             }
-            Event::Choice { id, title, body, options } => {
+            Event::Choice { id, title, body, options, preview } => {
                 writeln!(err, "{title}")?;
                 for b in &body {
                     writeln!(err, "  {b}")?;
                 }
-                let accept = if yes {
+                if let Some(p) = &preview {
+                    for l in p.lines().take(60) {
+                        writeln!(err, "    {l}")?;
+                    }
+                }
+                // Tool permissions are never auto-approved by --yes; they need a person.
+                let is_permission = preview.is_some();
+                let deny_index = if is_permission { options.len() - 1 } else { 1 };
+                let accept = if yes && !is_permission {
                     true
                 } else if options.len() >= 2 && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                     write!(err, "{}? [y/N] ", options[0])?;
@@ -163,15 +171,24 @@ pub async fn run(job: Job, yes: bool, tx: mpsc::Sender<Request>, mut rx: mpsc::R
                     let mut line = String::new();
                     std::io::stdin().lock().read_line(&mut line)?;
                     matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+                } else if is_permission {
+                    writeln!(err, "(denied: tool actions need confirmation on an interactive terminal)")?;
+                    false
                 } else {
                     writeln!(err, "(not confirmed; re-run with --yes to accept)")?;
                     false
                 };
                 pending_choice = accept;
-                tx.send(Request::Answer { id, choice: Some(if accept { 0 } else { 1 }) }).await?;
-                if !accept {
+                tx.send(Request::Answer { id, choice: Some(if accept { 0 } else { deny_index }) }).await?;
+                if !accept && !is_permission {
                     break;
                 }
+            }
+            Event::ToolStart { title, .. } => {
+                writeln!(err, "\n[tool] {title}")?;
+            }
+            Event::ToolEnd { ok, summary, .. } => {
+                writeln!(err, "[tool] {} {summary}", if ok { "ok" } else { "failed" })?;
             }
             Event::Download(p) => {
                 pending_choice = false;

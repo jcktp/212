@@ -19,9 +19,9 @@ interface with eight color themes. Ollama, Docker and model servers are **not**
 required. Cloud providers (OpenAI, Anthropic, any OpenAI-compatible endpoint)
 are optional.
 
-> Status: early development (v0.1). Local chat, model management, providers
-> and the terminal UI work today. Agentic coding tools (file editing, shell
-> commands) and persistent sessions are the next milestones; see
+> Status: early development (v0.1). Local chat, model management, providers,
+> the terminal UI and the coding agent (read, search, edit, run commands and
+> tests, with approval) work today. Persistent sessions are next; see
 > [docs/PROGRESS.md](docs/PROGRESS.md).
 
 ## Install
@@ -106,13 +106,38 @@ inside the working directory can be attached. Files that look like secrets
 | `/provider [local\|ollama\|openai\|anthropic\|compat] [model]` | switch provider without restarting |
 | `/theme [name]` | theme picker with live preview, or switch directly |
 | `/animations on\|reduced\|off` | animation level |
-| `/mode chat\|plan\|build` | agent mode (tools arrive in a later milestone) |
+| `/mode chat\|plan\|build` | agent mode (see below) |
 | `/new` · `/clear` | new conversation · clear the view |
 | `/context` · `/status` · `/doctor` | context usage · runtime status · diagnostics |
 | `/copy [code]` | copy the last reply or its last code block (OSC 52, works over SSH) |
 | `/unload` | stop the local model and free its memory |
 | `/backend` | install the verified llama.cpp backend |
 | `/help` · `/quit` | |
+
+### Agent modes
+
+| Mode | What the model can do |
+| --- | --- |
+| `chat` (default) | talk only. No tools. |
+| `plan` | read, list, find, grep, inspect the project and git history. Read-only. Ends with a plan. |
+| `build` | everything in plan, plus edit/create files, run commands and run tests |
+
+In build mode every edit shows a diff and every command shows its exact
+command line before anything happens. You choose **Allow once**, **Allow for
+this session** (all edits, or that exact command) or **Deny**. Commands that
+look risky (`rm -r`, `sudo`, `git push`, piping downloads into a shell…) always
+ask and can't be allowed for the whole session. Press `Esc` to stop the agent
+at any point; a running command is killed together with its child processes.
+`Ctrl+O` expands full diffs, command output and reasoning.
+
+Start in a mode with `212 --mode build`. Tools need a model whose chat
+template supports them (shown in `/models info`); larger models do much better.
+
+What the agent **cannot** do: access files outside the directory you started
+212 in, read credential files (`.env`, keys, `.ssh/`…), write inside `.git/`,
+or see your API keys (they are removed from command environments). Commands
+run with your user's permissions. There is no OS-level sandbox, so read the
+command before you allow it. Every tool call is logged to `logs/audit.jsonl`.
 
 ### Themes
 

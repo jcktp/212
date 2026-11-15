@@ -51,7 +51,8 @@ crates/
              Hugging Face client, Ollama registry + local-store reader, curated catalog
   inference  hardware detection, llama-server discovery, verified installer, process supervisor
   providers  Provider trait + OpenAI-compatible, Anthropic and mock implementations, SSE parser
-  runtime    the orchestrator: conversation, model lifecycle, downloads, provider switching, reports
+  tools      typed agent tools: JSON-schema definitions, validation, workspace confinement, diffs, process control
+  runtime    the orchestrator: conversation, agent loop, permission policy, model lifecycle, downloads, providers
   tui        Ratatui UI: themes, glyphs, ASCII art, animations, markdown, composer, overlays
   app        the `212` binary: CLI, logging, signals, headless mode
 ```
@@ -100,7 +101,28 @@ Dependency direction: `app → tui, runtime`; `runtime → providers, inference,
 - Credentials: environment variables only, never logged, never serialized (provider `Debug` impls omit keys).
 - `@file` attachments: resolved with `canonicalize` and must stay inside the working directory (symlink escapes are refused). Likely secrets are refused (`.env*`, private keys, `*.pem`/`*.key`, `.ssh`, `.aws`, `.gnupg`, `credentials`), binaries are refused, size is capped, and content is wrapped and labelled as data, not instructions.
 - Downloads and backend binaries: checksum-verified before use. Archives are extracted with traversal protection.
-- **Not yet implemented:** the tool permission system, command sandboxing and an audit log. These are core to the agent milestone, and until then the model has no tools at all.
+- **Agent tools** (see the next section): every tool call is validated, confined to the workspace, approved according to the mode and policy, and recorded in `logs/audit.jsonl`.
+- **Not implemented:** an OS-level sandbox for commands. Commands run with the user's privileges; the user's approval is the control.
+
+## The agent
+
+```
+user message ─► model call (tools offered for the mode) ─► text? ─────────────► done
+                     ▲                                  └► tool calls
+                     │                                       │ tools::plan  (parse JSON args, resolve paths, compute diff / command)
+                     │                                       │ policy       (mode × kind × session grants × risk) ─► ask user if needed
+                     │                                       │ tools::execute (reads in parallel, the rest in order)
+                     └──────────── tool results (data, capped 16k chars) ◄──┘
+```
+
+- **Tools** (`crates/tools`): `read_file`, `list_dir`, `find_files`, `grep`, `project_info`, `git_status`, `git_diff`, `git_log` (read); `write_file`, `edit_file` (write); `run_command`, `run_tests` (execute). Arguments are deserialized into typed structs, so wrong types or missing fields go back to the model as an error result, never into execution.
+- **Plan, then execute.** Planning computes the exact effect. Edits keep the original content and refuse to apply if the file changed after the diff was shown. Writes are atomic (temp file + rename).
+- **Workspace confinement.** Paths are normalized lexically (no `..` above the root, no absolute paths elsewhere) and then through `canonicalize`, so symlinks can't escape. `.git/` and credential-looking files are off limits.
+- **Policy** (`runtime::permissions`): chat offers no tools; plan offers read-only tools and denies anything else even if the model calls it; build allows reads and asks for writes and commands. "Allow for session" grants are per kind for edits and per exact command line for commands, and are never offered for commands flagged risky. The risk heuristic is string-based and only adds warnings; approval remains the defense.
+- **Processes.** `sh -c` (or `cmd /C`) runs in the workspace root with stdin closed, API-key variables removed, `TERM=dumb`/`NO_COLOR`/`CI=1`, a timeout (default 120 s, at most 600 s), and its own process group. That group is killed on timeout or `Esc`, including background children. Output is capped, keeping the head and tail.
+- **Loop bounds.** `agent.max_steps` model calls per message. Connection failures before any output are retried twice with backoff. Older tool results in a long turn are shortened when the context fills (the user is told). A cancel at any point ends the turn, and every tool call still gets exactly one result message so the history stays valid.
+- **Tool-call formats.** Native OpenAI-style tool calls (llama.cpp parses them from the model's chat template with `--jinja`). As a compatibility fallback, `<tool_call>{json}</tool_call>` blocks in plain text are parsed and validated like any other call. Local models whose template declares no tool support run without tools, and the user is told why.
+- **Untrusted content.** The system prompt tells the model that tool results are data and must not be followed as instructions. Since no prompt is a guarantee, the permission prompts and confinement above are what actually protect the user.
 
 ## Major risks
 
@@ -117,5 +139,5 @@ Dependency direction: `app → tui, runtime`; `runtime → providers, inference,
 
 - **Inference engines:** `inference::server` is the only place that knows about llama-server. Another engine can provide the same "spawn → ready → OpenAI-compatible URL" contract.
 - **Providers:** implement `providers::Provider` (`chat` → event stream, `list_models`).
-- **Tools (next):** a `tools` crate with typed tools (JSON-schema args, validation, structured results) and a permission policy. The runtime's generation task becomes an agent loop that executes tool calls between provider turns.
+- **Tools:** add a `Spec` and an `Action` variant in `crates/tools`. The kind determines the default policy automatically. A documentation fetch tool (network, opt-in) and MCP-style external tools fit here.
 - **Semantic indexing:** a future retrieval provider behind the same `@`-attachment and context-selection path. Deterministic search comes first.

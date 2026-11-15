@@ -1,6 +1,6 @@
 # Progress
 
-_Last updated: 2026-11-15 · version 0.1.0_
+_Last updated: 2026-11-15 · version 0.1.0 · Phase 5 complete_
 
 ## First working milestone: done
 
@@ -21,6 +21,22 @@ daemon. The managed-backend run also had Homebrew removed from `PATH`.
 | 9 | Status animations | boot sequence, loading bar, spinner, pulse, bounce, scan (checksum), download bar |
 | 10 | Clean exit with no background processes | Ctrl+C, `/quit`, SIGTERM, SIGHUP all stop llama-server. After SIGKILL the next launch reaps the orphan. |
 
+## Phase 5 (agent runtime): done
+
+The acceptance criterion ("inspect a repository, propose changes, modify
+approved files, run tests, and report results") was run for real with
+**Gemma 4 12B (Q4_K_M)**, imported by hard link from the local Ollama store,
+served by the managed llama.cpp backend on Metal at about 11 tok/s, in a real
+terminal. Demo project: a two-function Python module with a bug
+(`add` subtracts) and two failing unittest tests.
+
+1. `212 --mode build`, prompt: *"The tests are failing. Find the bug, fix it, and run the tests to confirm."*
+2. The agent asked to run `make test` (approval dialog showing the exact command), saw both tests fail, listed the project and read `calc.py`.
+3. It sent `edit_file` twice with a snippet that didn't match the file exactly (it over-escaped the docstring quotes). Both were refused with "old_string was not found"; it re-read the file and proposed the right edit.
+4. The approval dialog showed the diff (`-    return a - b` / `+    return a + b`); approved once, applied atomically.
+5. It re-ran `make test` (approved with *Always allow this command this session*): `Ran 2 tests … OK`. It then summarized the fix.
+6. A follow-up "run the tests once more" executed without a prompt (session grant). All 9 tool calls are in `logs/audit.jsonl`. Exiting left no llama-server running.
+
 ## Phase status
 
 | Phase | Status |
@@ -29,7 +45,7 @@ daemon. The managed-backend run also had Homebrew removed from `PATH`.
 | 2 Terminal interface | ✅ |
 | 3 Local inference | ✅ |
 | 4 Model management | ✅ except `/models benchmark` and vision projectors |
-| 5 Agent runtime | ⏳ not started. Modes exist and are displayed, but the model has no tools yet. |
+| 5 Agent runtime | ✅ tools, permission policy, agent loop, chat/plan/build modes, diff previews, audit log |
 | 6 Persistence and providers | 🟡 providers done; sessions/SQLite, export, history search, keychain storage and compaction not started |
 | 7 Polish and release | 🟡 onboarding and benchmarks done; packaging and cross-platform testing not started |
 
@@ -42,11 +58,15 @@ daemon. The managed-backend run also had Homebrew removed from `PATH`.
 - **Models:** GGUF metadata reader, memory estimates with fit verdicts, capability detection, a hard-link-based store, resumable SHA-256-verified downloads with progress/speed/ETA, HF search and pull (quant selection, split files, license, gated hint, disk-space check), Ollama registry pull without the daemon, local Ollama store import, curated recommendations by hardware.
 - **Providers:** local, Ollama, OpenAI, Anthropic and OpenAI-compatible, switchable at runtime. Streaming, usage, measured speed and clear auth/connection errors.
 - **Headless:** `212 -p`, piped stdin, `212 models …`, `212 doctor`, `212 backend`, `212 paths`. Reasoning goes to stderr so stdout stays pipe-clean. Exit codes are meaningful.
+- **Agent:** 12 typed tools (read/list/find/grep/project info/git status·diff·log/write/edit/run command/run tests), JSON-schema definitions, argument validation, workspace confinement (lexical + symlink), protected `.git/` and credential files, plan→approve→execute with diffs computed before anything changes, stale-edit detection, atomic writes, process-group kill on timeout/cancel, API keys scrubbed from command environments, allow once / for session / deny, risky-command detection, parallel reads, bounded steps and retries, in-turn context shortening, text tool-call fallback, an audit log, and mode enforcement even when the model calls a tool that wasn't offered. The UI shows a live tool activity line ("reading / searching / editing / running tests / waiting for your approval"), tool results with diffs and output tails, and expands everything with Ctrl+O.
 - **Safety:** `@file` attachments are confined to the workspace (no symlink escapes), secret-looking files are refused, size is capped, and content is labelled as data. Explicit approval is required for every download and backend install.
 
 ## Known limitations
 
-- **No agent tools yet.** `plan`/`build` modes change only the label. File reading/editing, shell execution, the permission system and diff previews come in the next milestone.
+- **No OS sandbox for commands.** They run with your user's privileges in the project directory. The approval dialog is the safeguard, and the risky-command detector is a heuristic warning, not a guarantee.
+- **Small models are weak agents.** Qwen3-0.6B declares tool support but rarely uses tools well. Gemma 4 12B worked, but needed retries on exact-match edits. Prefer 8B+ models for build mode, or a cloud provider.
+- **No documentation/web fetch tool** yet, and no undo/checkpoint for applied edits (use git).
+- **The context meter** updates after each message, not live during a multi-step turn.
 - **No persistent sessions.** The conversation lives in memory. `/new`, `/clear` and `/context` work; `/sessions`, `/resume`, `/history` and `/export` are not implemented.
 - **Context:** when the window fills, the oldest turns are left out and the user is told. There is no summarizing compaction yet (`/compact` explains this).
 - **Credentials** come from environment variables only (no keychain integration yet).
@@ -59,7 +79,7 @@ daemon. The managed-backend run also had Homebrew removed from `PATH`.
 
 ## Test results
 
-`cargo fmt --check` ✅ · `cargo clippy --all-targets -- -D warnings` ✅ · `cargo test`: **107 passed, 0 failed, 1 ignored**
+`cargo fmt --check` ✅ · `cargo clippy --all-targets -- -D warnings` ✅ · `cargo test`: **138 passed, 0 failed, 1 ignored**
 
 | Suite | Tests | Covers |
 | --- | --- | --- |
@@ -68,8 +88,9 @@ daemon. The managed-backend run also had Homebrew removed from `PATH`.
 | models | 24 | GGUF parsing (incl. truncated/corrupt), estimates, capabilities, store import/remove/hard links, downloads (verify, **resume after interruption**, server ignoring Range, checksum mismatch, cancel), HF spec/quant/split selection, Ollama refs/manifests/local store, catalog |
 | inference | 9 | backend discovery and versions, **process lifecycle** (early exit diagnosis, cancel + shutdown kills the process), orphan reaping never kills unrelated processes, release asset selection, archive traversal protection |
 | providers | 8 | SSE parsing across chunk boundaries/UTF-8, OpenAI chunk mapping (text/reasoning/tools/usage/speed/errors), real HTTP streaming, connect errors, key never leaks, Anthropic body/events |
-| runtime | 6 + 8 | context selection, `@file` safety; **mock-provider integration**: streaming, history, cancellation keeps partial text, failed turns not duplicated, concurrency guard, new conversation, shutdown, error reporting |
-| tui | 27 + 12 | themes (all 8, custom, validation, color degradation), glyphs, art, animations (static under reduced motion), markdown wrapping/highlighting, composer, commands; **TestBackend UI**: every theme at 5 sizes, picker preview/restore/persist, sending, streaming render, slash → request mapping, Ctrl+C semantics, dialogs, ASCII-only output, monochrome output, idle never ticks, completion |
+| tools | 14 | argument validation, path confinement and symlink escapes, protected files, read/list/find/grep with .gitignore, write/edit diffs, stale-edit refusal, exit codes, env scrubbing, **timeout and cancel kill the whole process group**, git status, project and test-command detection |
+| runtime | 9 + 9 + 10 | context selection, `@file` safety, policy matrix, audit log, text tool-call fallback; **mock-provider integration**: streaming, history, cancellation keeps partial text, failed turns not duplicated, retries, concurrency guard, shutdown, errors; **agent loop**: reads run unasked and feed back, approved edit applies the diff, denied edit leaves the file and informs the model, session grant, plan mode refuses writes, chat offers no tools, invalid args become tool errors, step limit, cancel kills a running command, cancel dismisses a pending approval |
+| tui | 28 + 14 | themes (all 8, custom, validation, color degradation), glyphs, art, animations (static under reduced motion), markdown wrapping/highlighting, composer, commands; **TestBackend UI**: every theme at 5 sizes, picker preview/restore/persist, sending, streaming render, slash → request mapping, Ctrl+C semantics, dialogs, ASCII-only output, monochrome output, idle never ticks, completion, tool activity and diff rendering, permission dialog preview/answer/dismiss, template-token stripping |
 | app | 4 + 1 ignored | CLI smoke tests; `real_inference` (opt-in, passes: import → load → stream → clean exit) |
 
 Run the real-inference test:
@@ -92,6 +113,6 @@ TWO_ONE_TWO_TEST_GGUF=/path/to/Qwen3-0.6B-Q8_0.gguf cargo test -p two-one-two --
 
 ## Next milestones
 
-1. **Agent runtime (Phase 5):** `tools` crate (read/list/search/glob/edit/write/shell/git/tests) with JSON-schema validation and structured results. Workspace-confined paths, a permission policy (allow once / for session / deny) through the existing `Choice` protocol, diff previews, and an audit log. A bounded agent loop in the runtime with timeouts and retries. Mode enforcement (chat: no tools; plan: read-only; build: edits and approved commands). Native tool calling via llama.cpp `--jinja`, with a clearly labelled fallback parser.
-2. **Sessions (Phase 6):** SQLite (rusqlite, bundled): sessions per project, resume, rename, delete, search, export to Markdown/JSON, provider/model metadata. Summarizing `/compact`. Keychain credential storage.
+1. **Sessions (Phase 6):** SQLite (rusqlite, bundled): sessions per project, resume, rename, delete, search, export to Markdown/JSON, provider/model metadata. Summarizing `/compact`. Keychain credential storage.
+2. **Agent polish:** an opt-in documentation fetch tool, checkpoints/undo for applied edits, a live context meter during turns, and optional OS sandboxing (macOS `sandbox-exec` profiles, Linux namespaces/landlock).
 3. **Release (Phase 7):** CI on all three OSes, release binaries with checksums, a Homebrew tap, a terminal compatibility pass, `/models benchmark`, vision projector support.

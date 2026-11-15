@@ -187,11 +187,12 @@ fn choice_dialog_answers() {
         title: "Download 1 GB?".into(),
         body: vec!["x".into()],
         options: vec!["Download".into(), "Cancel".into()],
+        preview: None,
     });
     app_has_text(&mut a, "Download 1 GB?");
     key(&mut a, KeyCode::Enter);
     assert!(matches!(a.outbox.last(), Some(Request::Answer { id: 7, choice: Some(0) })));
-    a.on_core(Event::Choice { id: 8, title: "t".into(), body: vec![], options: vec!["A".into(), "B".into()] });
+    a.on_core(Event::Choice { id: 8, title: "t".into(), body: vec![], options: vec!["A".into(), "B".into()], preview: None });
     key(&mut a, KeyCode::Esc);
     assert!(matches!(a.outbox.last(), Some(Request::Answer { id: 8, choice: None })));
 }
@@ -241,4 +242,51 @@ fn slash_completion_popup() {
     assert_eq!(c.items[0].0, "/theme");
     key(&mut a, KeyCode::Tab);
     assert_eq!(a.composer.text(), "/theme ");
+}
+
+#[test]
+fn tool_activity_and_diff_render() {
+    let (mut a, _t) = app();
+    a.on_core(Event::Inference(InferenceState::Generating));
+    a.on_core(Event::TurnStart);
+    a.on_core(Event::ToolStart { id: "1".into(), tool: "edit_file".into(), title: "edit app.py".into() });
+    app_has_text(&mut a, "editing");
+    a.on_core(Event::ToolEnd {
+        id: "1".into(),
+        ok: true,
+        summary: "+1 -1".into(),
+        detail: Some("--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,2 @@\n-    return 'hello'\n+    return 'hi'".into()),
+    });
+    a.on_core(Event::Delta(StreamEvent::Text("Changed the greeting.".into())));
+    a.on_core(Event::TurnEnd { completion_tokens: 9, elapsed_ms: 900, tokens_per_second: None, cancelled: false });
+    a.on_core(Event::Inference(InferenceState::Ready));
+    let screen = render(&mut a, 100, 30);
+    assert!(screen.contains("edit app.py · +1 -1"), "{screen}");
+    assert!(screen.contains("+    return 'hi'"));
+    assert!(!screen.contains("+++ b/app.py"), "file headers are hidden");
+    assert!(screen.contains("Changed the greeting."));
+    // The continuation after a tool call has no second header.
+    assert_eq!(screen.matches("◆").count(), 1, "{screen}");
+}
+
+#[test]
+fn permission_dialog_shows_preview_and_answers() {
+    let (mut a, _t) = app();
+    a.on_core(Event::Inference(InferenceState::Generating));
+    a.on_core(Event::Choice {
+        id: 3,
+        title: "Allow: run `cargo test`?".into(),
+        body: vec!["The model wants to run this:".into()],
+        options: vec!["Allow once".into(), "Always allow this command this session".into(), "Deny".into()],
+        preview: Some("$ cargo test".into()),
+    });
+    let screen = render(&mut a, 110, 30);
+    assert!(screen.contains("$ cargo test") && screen.contains("waiting for your approval"), "{screen}");
+    key(&mut a, KeyCode::Char('3'));
+    assert!(matches!(a.outbox.last(), Some(Request::Answer { id: 3, choice: Some(2) })));
+    // A dismissed prompt closes without answering.
+    a.on_core(Event::Choice { id: 4, title: "x".into(), body: vec![], options: vec!["a".into(), "b".into()], preview: None });
+    a.outbox.clear();
+    a.on_core(Event::Dismiss { id: 4 });
+    assert!(matches!(a.overlay, Overlay::None) && a.outbox.is_empty());
 }

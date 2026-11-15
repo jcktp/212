@@ -46,8 +46,8 @@ disturbing your comments or formatting**.
 | Key | Default | |
 | --- | --- | --- |
 | `default_mode` | `"chat"` | `chat`, `plan`, `build` |
-| `max_steps` | `30` | 1 – 500. Agent loop bound (agent milestone). |
-| `require_command_approval` | `true` | agent milestone |
+| `max_steps` | `30` | 1 – 500. Model calls per user message before the agent stops and asks you to say "continue". |
+| `require_command_approval` | `true` | `false` runs non-risky commands without asking. Risky commands always ask, and edits always ask unless allowed for the session. |
 
 ### `[models]`
 

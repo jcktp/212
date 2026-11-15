@@ -236,11 +236,30 @@ pub enum Event {
         lines: Vec<ReportLine>,
     },
     /// Ask the user to choose. The UI answers with [`Request::Answer`].
+    /// `preview` is a diff or command shown verbatim (diff lines colored).
     Choice {
         id: u64,
         title: String,
         body: Vec<String>,
         options: Vec<String>,
+        preview: Option<String>,
+    },
+    /// A pending choice is no longer relevant (e.g. the turn was cancelled).
+    Dismiss {
+        id: u64,
+    },
+    /// The agent started a tool call.
+    ToolStart {
+        id: String,
+        tool: String,
+        title: String,
+    },
+    /// The tool call finished. `detail` is a diff or output excerpt for the UI.
+    ToolEnd {
+        id: String,
+        ok: bool,
+        summary: String,
+        detail: Option<String>,
     },
     /// The conversation was reset.
     Cleared,

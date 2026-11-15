@@ -7,15 +7,17 @@
 //! to the runtime through an internal channel. The runtime therefore never
 //! blocks on I/O for long, and Cancel is always handled promptly.
 
+mod agent;
 mod attach;
 mod chat;
 mod context;
 mod doctor;
 mod local;
 mod modelops;
+pub mod permissions;
 mod providers_setup;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,12 +34,36 @@ pub use context::estimate_tokens;
 
 /// Work that finished in a background task and must update runtime state.
 enum Internal {
-    Loaded { id: String, result: Result<LlamaServer, String> },
-    Generated { message: Option<Message>, prompt_tokens: Option<u64>, completion_tokens: u64, failed_empty: bool },
-    Downloaded { result: Result<modelops::Fetched, String> },
-    BackendInstalled { result: Result<PathBuf, String> },
-    BackendProbed { backend: Backend },
-    Choice { action: PendingAction, title: String, body: Vec<String>, options: Vec<String> },
+    Loaded {
+        id: String,
+        result: Result<LlamaServer, String>,
+    },
+    Generated {
+        messages: Vec<Message>,
+        prompt_tokens: Option<u64>,
+        completion_tokens: u64,
+        failed_empty: bool,
+    },
+    /// The agent wants to run a tool that needs a policy decision.
+    Permission {
+        plan: Box<tools::Plan>,
+        reply: tokio::sync::oneshot::Sender<permissions::Decision>,
+    },
+    Downloaded {
+        result: Result<modelops::Fetched, String>,
+    },
+    BackendInstalled {
+        result: Result<PathBuf, String>,
+    },
+    BackendProbed {
+        backend: Backend,
+    },
+    Choice {
+        action: PendingAction,
+        title: String,
+        body: Vec<String>,
+        options: Vec<String>,
+    },
 }
 
 /// Something waiting for the user's answer to an [`Event::Choice`].
@@ -47,6 +73,7 @@ enum PendingAction {
     OfferInstallBackend,
     ImportOllamaLocal(models::ollama::LocalOllamaModel),
     LoadModel(String),
+    Permission { plan: Box<tools::Plan>, reply: tokio::sync::oneshot::Sender<permissions::Decision>, session_option: bool },
 }
 
 pub struct Runtime {
@@ -81,6 +108,10 @@ pub struct Runtime {
     cwd: PathBuf,
     /// Interactive sessions load models automatically (on start, after import).
     autoload: bool,
+    /// "Allow for session" grants (tool grant keys).
+    grants: HashSet<String>,
+    /// Models already warned about missing tool support.
+    warned_no_tools: HashSet<String>,
 }
 
 pub struct RuntimeOptions {
@@ -130,6 +161,8 @@ impl Runtime {
             context_used: 0,
             cwd: opts.cwd,
             autoload: opts.autoload,
+            grants: HashSet::new(),
+            warned_no_tools: HashSet::new(),
         })
     }
 
@@ -241,7 +274,7 @@ impl Runtime {
 
     async fn choice(&mut self, action: PendingAction, title: String, body: Vec<String>, options: Vec<String>) {
         let id = self.ask(action);
-        self.emit(Event::Choice { id, title, body, options }).await;
+        self.emit(Event::Choice { id, title, body, options, preview: None }).await;
     }
 
     fn save_setting(&mut self, section: &str, key: &str, value: toml_edit::Value) {
@@ -254,6 +287,7 @@ impl Runtime {
         match req {
             Request::Send { text } => self.send(text).await,
             Request::Cancel => {
+                self.dismiss_permissions().await;
                 if let Some(c) = self.generation.take() {
                     c.cancel();
                 } else if let Some((_, c)) = self.loading.take() {
@@ -264,10 +298,12 @@ impl Runtime {
                 self.queued_send = None;
             }
             Request::NewConversation => {
+                self.dismiss_permissions().await;
                 if let Some(c) = self.generation.take() {
                     c.cancel();
                 }
                 self.messages.clear();
+                self.grants.clear();
                 self.context_used = 0;
                 self.emit(Event::Cleared).await;
                 self.snapshot().await;
@@ -292,16 +328,14 @@ impl Runtime {
             Request::SetMode(m) => {
                 self.mode = m;
                 self.snapshot().await;
-                if m != AgentMode::Chat {
-                    self.notice(
-                        NoticeLevel::Info,
-                        format!(
-                            "Mode: {}. Tool use (file access, commands) arrives in the agent milestone; for now the model can only chat.",
-                            m.as_str()
-                        ),
-                    )
-                    .await;
-                }
+                let text = match m {
+                    AgentMode::Chat => "Mode: chat — conversation only; no file access or commands.",
+                    AgentMode::Plan => "Mode: plan — the model can read and search this project (read-only) and propose a plan.",
+                    AgentMode::Build => {
+                        "Mode: build — the model can edit files and run commands. Every edit and command asks for your approval."
+                    }
+                };
+                self.notice(NoticeLevel::Info, text).await;
             }
             Request::SaveSetting { section, key, value } => {
                 let v: toml_edit::Value = match value {
@@ -329,6 +363,17 @@ impl Runtime {
             PendingAction::OfferInstallBackend if accepted => self.offer_backend_install().await,
             PendingAction::ImportOllamaLocal(m) if accepted => self.import_ollama_local(m).await,
             PendingAction::LoadModel(id) if accepted => self.load_model(&id).await,
+            PendingAction::Permission { plan, reply, session_option } => {
+                let decision = match choice {
+                    Some(0) => permissions::Decision::Allow,
+                    Some(1) if session_option => {
+                        self.grants.insert(plan.grant_key.clone());
+                        permissions::Decision::Allow
+                    }
+                    _ => permissions::Decision::Deny("the user declined".into()),
+                };
+                let _ = reply.send(decision);
+            }
             PendingAction::Download(_) => self.notice(NoticeLevel::Info, "Download skipped.").await,
             _ => {}
         }
@@ -337,15 +382,14 @@ impl Runtime {
     async fn on_internal(&mut self, msg: Internal) {
         match msg {
             Internal::Loaded { id, result } => self.on_loaded(id, result).await,
-            Internal::Generated { message, prompt_tokens, completion_tokens, failed_empty } => {
+            Internal::Permission { plan, reply } => self.on_permission(plan, reply).await,
+            Internal::Generated { messages, prompt_tokens, completion_tokens, failed_empty } => {
                 self.generation = None;
                 if failed_empty && self.messages.last().is_some_and(|m| m.role == common::Role::User) {
                     // Nothing came back: drop the user turn so a retry doesn't duplicate it.
                     self.messages.pop();
                 }
-                if let Some(m) = message {
-                    self.messages.push(m);
-                }
+                self.messages.extend(messages);
                 if let Some(p) = prompt_tokens {
                     self.context_used = (p + completion_tokens) as u32;
                 }

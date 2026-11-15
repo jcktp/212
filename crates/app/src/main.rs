@@ -27,6 +27,9 @@ struct Cli {
     /// Provider for this run: local, ollama, openai, anthropic, compat.
     #[arg(long)]
     provider: Option<String>,
+    /// Agent mode for this run: chat, plan or build.
+    #[arg(long)]
+    mode: Option<String>,
     /// Theme for this run.
     #[arg(long)]
     theme: Option<String>,
@@ -101,6 +104,10 @@ fn main() -> anyhow::Result<()> {
     let mut config = loaded.config.clone();
     if let Some(p) = &cli.provider {
         config.inference.provider = p.clone();
+    }
+    if let Some(m) = &cli.mode {
+        anyhow::ensure!(common::proto::AgentMode::parse(m).is_some(), "--mode must be chat, plan or build");
+        config.agent.default_mode = m.clone();
     }
     if let Some(m) = &cli.model {
         config.inference.default_model = Some(m.clone());
