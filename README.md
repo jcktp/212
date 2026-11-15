@@ -30,7 +30,7 @@ Only building from source is available right now. Homebrew, release binaries
 and other channels are planned but **not yet published**.
 
 ```bash
-git clone <this repository> 212 && cd 212
+git clone https://github.com/jcktp/212.git && cd 212
 cargo install --path crates/app
 ```
 
