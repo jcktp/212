@@ -1,0 +1,28 @@
+[package]
+name = "two-one-two-inference"
+description = "Hardware detection and managed llama.cpp backend lifecycle for 212"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common.workspace = true
+models.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+sysinfo.workspace = true
+rand.workspace = true
+zip.workspace = true
+flate2 = "1"
+tar = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "two-one-two-runtime"
+description = "The 212 runtime: conversation, model lifecycle, providers and downloads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+common.workspace = true
+config.workspace = true
+inference.workspace = true
+models.workspace = true
+providers.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+common.workspace = true
+config.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "two-one-two"
+description = "212 — a lightweight, retro-styled, local-first AI terminal agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "212"
+
+[[bin]]
+name = "212"
+path = "src/main.rs"
+
+[dependencies]
+common.workspace = true
+config.workspace = true
+runtime.workspace = true
+tui.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+config.workspace = true

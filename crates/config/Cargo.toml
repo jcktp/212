@@ -1,0 +1,15 @@
+[package]
+name = "two-one-two-config"
+description = "Configuration loading, validation and persistence for 212"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

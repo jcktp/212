@@ -1,0 +1,10 @@
+[package]
+name = "two-one-two-common"
+description = "Shared types, protocol and paths for 212"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+directories.workspace = true

@@ -1,0 +1,17 @@
+# Example custom theme. Copy to <config dir>/themes/midnight-teal.toml
+# (run `212 paths` to find the config dir), then `/theme midnight-teal`.
+name = "Midnight Teal"
+description = "deep teal with warm accents"
+base = "cyber"            # any color not listed is inherited from this built-in theme
+
+[colors]
+bg = "#081418"
+surface = "#0d1d22"
+text = "#d7f4f2"
+muted = "#5f8a88"
+primary = "#3fe0c5"
+secondary = "#f2a65a"
+border = "#1f3d42"
+selection_bg = "#174a4a"
+selection_fg = "#ffffff"
+code_bg = "#0a191d"
