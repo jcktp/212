@@ -114,6 +114,7 @@ pub async fn run_command(root: &Path, command: &str, timeout: Duration, scrub: &
         Ok(c) => c,
         Err(e) => return ToolOutput::error(format!("could not start command: {e}")),
     };
+    #[cfg(unix)]
     let pid = child.id();
     let out_task = tokio::spawn(read_capped(child.stdout.take().unwrap()));
     let err_task = tokio::spawn(read_capped(child.stderr.take().unwrap()));
