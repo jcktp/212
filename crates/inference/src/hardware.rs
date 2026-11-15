@@ -103,13 +103,22 @@ fn nvidia_smi() -> Option<Accel> {
     Some(Accel::Cuda { name: name.trim().to_string(), vram: mem.trim().parse::<u64>().ok().map(|mib| mib * 1024 * 1024) })
 }
 
+/// Windows `canonicalize` returns `\\?\C:\…`; mount points are `C:\`.
+fn strip_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => std::path::PathBuf::from(rest),
+        _ => p,
+    }
+}
+
 /// Free space on the volume containing `path` (or its nearest existing ancestor).
 pub fn free_space(path: &Path) -> Option<u64> {
     let mut p = path.to_path_buf();
     while !p.exists() {
         p = p.parent()?.to_path_buf();
     }
-    let p = std::fs::canonicalize(p).ok()?;
+    let p = strip_verbatim(std::fs::canonicalize(p).ok()?);
     let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
     disks.iter().filter(|d| p.starts_with(d.mount_point())).max_by_key(|d| d.mount_point().as_os_str().len()).map(|d| d.available_space())
 }
@@ -124,5 +133,6 @@ mod tests {
         assert!(h.cpu_cores >= 1);
         assert!(h.model_memory() > 0);
         assert!(free_space(&std::env::temp_dir()).is_some());
+        assert_eq!(strip_verbatim(r"\\?\C:\x".into()), std::path::PathBuf::from(r"C:\x"));
     }
 }
