@@ -1138,7 +1138,7 @@ impl App {
                 ("remove" | "rm" | "delete", p) if !p.is_empty() => self.send(Request::RemoveCredential { provider: p.into() }),
                 ("", _) => self.notice(
                     NoticeLevel::Info,
-                    "Usage: /key <openai|anthropic|compat|huggingface> stores a key in the system keychain; /key remove <provider> deletes it. Environment variables still take precedence.",
+                    "Usage: /key <openai|anthropic|compat|huggingface|brave> stores a key in the system keychain; /key remove <provider> deletes it. Environment variables still take precedence.",
                 ),
                 (p, _) => self.overlay = Overlay::Secret { provider: p.to_lowercase(), buf: String::new() },
             },

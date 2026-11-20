@@ -141,6 +141,200 @@ pub async fn fetch(client: &Client, raw: &str) -> Result<Page, String> {
     Ok(Page { url: final_url, title: if title.is_empty() { host } else { title }, text })
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+}
+
+pub const DDG_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+pub const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
+
+/// Where `web_search` sends queries (`agent.search` in the config).
+#[derive(Clone, PartialEq, Default)]
+pub enum SearchBackend {
+    /// DuckDuckGo's HTML page. No key, but it may refuse automated queries.
+    #[default]
+    DuckDuckGo,
+    /// A SearXNG instance (often self-hosted) with the JSON format enabled.
+    SearxNg { url: String },
+    /// The Brave Search API.
+    Brave { key: String },
+}
+
+impl std::fmt::Debug for SearchBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe()) // never print the key
+    }
+}
+
+impl SearchBackend {
+    pub fn describe(&self) -> String {
+        match self {
+            Self::DuckDuckGo => "DuckDuckGo (html.duckduckgo.com)".into(),
+            Self::SearxNg { url } => format!("SearXNG ({url})"),
+            Self::Brave { .. } => "Brave Search (api.search.brave.com)".into(),
+        }
+    }
+}
+
+const BLOCKED_HELP: &str = "Configure a search backend meant for programs: set agent.search = \"searxng\" with \
+agent.searxng_url (e.g. a self-hosted instance), or agent.search = \"brave\" with a Brave Search API key (212 key set brave).";
+
+/// Run a web search with the configured backend.
+pub async fn search(client: &Client, backend: &SearchBackend, query: &str, max: usize) -> Result<Vec<SearchHit>, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("empty search query".into());
+    }
+    match backend {
+        SearchBackend::DuckDuckGo => {
+            let url = reqwest::Url::parse_with_params(DDG_ENDPOINT, &[("q", query)]).map_err(|e| e.to_string())?;
+            let resp = client.get(url).send().await.map_err(|e| format!("search request failed: {e}"))?;
+            let status = resp.status();
+            let html = resp.text().await.map_err(|e| e.to_string())?;
+            let hits = parse_search(&html, max);
+            if hits.is_empty() && (status.as_u16() == 202 || html.contains("anomaly")) {
+                return Err(format!(
+                    "DuckDuckGo refused the automated search (bot check). If you know a relevant URL (official docs, \
+                     crates.io/api/v1/crates/<name>, en.wikipedia.org/wiki/<topic>…) use web_fetch on it directly. \
+                     For the user: {BLOCKED_HELP}"
+                ));
+            }
+            if !status.is_success() {
+                return Err(format!("search returned HTTP {}", status.as_u16()));
+            }
+            Ok(hits)
+        }
+        SearchBackend::SearxNg { url } => {
+            let base = url.trim_end_matches('/');
+            let endpoint = if base.ends_with("/search") { base.to_string() } else { format!("{base}/search") };
+            let url = reqwest::Url::parse_with_params(&endpoint, &[("q", query), ("format", "json")])
+                .map_err(|e| format!("invalid agent.searxng_url: {e}"))?;
+            let resp = client.get(url).send().await.map_err(|e| format!("SearXNG request failed: {e}"))?;
+            if resp.status().as_u16() == 403 {
+                return Err("SearXNG refused the request (403): enable the json format under search.formats in its settings.yml".into());
+            }
+            if !resp.status().is_success() {
+                return Err(format!("SearXNG returned HTTP {}", resp.status().as_u16()));
+            }
+            let v: serde_json::Value = resp.json().await.map_err(|e| format!("SearXNG returned invalid JSON: {e}"))?;
+            Ok(json_hits(v.get("results"), "content", max))
+        }
+        SearchBackend::Brave { key } => {
+            if key.is_empty() {
+                return Err("no Brave Search API key: run `212 key set brave` or set BRAVE_API_KEY".into());
+            }
+            let count = max.to_string();
+            let url =
+                reqwest::Url::parse_with_params(BRAVE_ENDPOINT, &[("q", query), ("count", count.as_str())]).map_err(|e| e.to_string())?;
+            let resp = client
+                .get(url)
+                .header("X-Subscription-Token", key)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send()
+                .await
+                .map_err(|e| format!("Brave Search request failed: {e}"))?;
+            match resp.status().as_u16() {
+                200 => {}
+                401 | 403 => return Err("Brave Search rejected the API key (212 key set brave)".into()),
+                429 => return Err("Brave Search rate limit reached; try again later".into()),
+                s => return Err(format!("Brave Search returned HTTP {s}")),
+            }
+            let v: serde_json::Value = resp.json().await.map_err(|e| format!("Brave Search returned invalid JSON: {e}"))?;
+            Ok(json_hits(v.pointer("/web/results"), "description", max))
+        }
+    }
+}
+
+/// Results from a JSON array of `{title, url, <snippet_key>}` objects.
+pub fn json_hits(results: Option<&serde_json::Value>, snippet_key: &str, max: usize) -> Vec<SearchHit> {
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for r in results.and_then(|r| r.as_array()).into_iter().flatten() {
+        let get = |k: &str| r.get(k).and_then(|v| v.as_str()).map(strip_tags).unwrap_or_default();
+        let (title, url, snippet) = (get("title"), get("url"), get(snippet_key));
+        if url.starts_with("http") && !title.is_empty() && !hits.iter().any(|h| h.url == url) {
+            hits.push(SearchHit { title, url, snippet });
+        }
+        if hits.len() >= max {
+            break;
+        }
+    }
+    hits
+}
+
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    decode_entities(out.split_whitespace().collect::<Vec<_>>().join(" ").as_str())
+}
+
+/// DuckDuckGo wraps some links as `//duckduckgo.com/l/?uddg=<encoded>`.
+fn unwrap_redirect(href: &str) -> Option<String> {
+    let href = decode_entities(href);
+    let abs = if href.starts_with("//") { format!("https:{href}") } else { href };
+    let url = reqwest::Url::parse(&abs).ok()?;
+    if url.host_str().is_some_and(|h| h.ends_with("duckduckgo.com")) {
+        if url.path().starts_with("/y.js") {
+            return None; // ad
+        }
+        return url.query_pairs().find(|(k, _)| k == "uddg").map(|(_, v)| v.into_owned());
+    }
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+}
+
+pub fn parse_search(html: &str, max: usize) -> Vec<SearchHit> {
+    const LINK: &str = "class=\"result__a\"";
+    const SNIP: &str = "class=\"result__snippet\"";
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut rest = html;
+    while hits.len() < max {
+        let Some(i) = rest.find(LINK) else { break };
+        rest = &rest[i + LINK.len()..];
+        let next = rest.find(LINK).unwrap_or(rest.len());
+        let block = &rest[..next];
+        let href = block.find("href=\"").map(|h| &block[h + 6..]).and_then(|s| s.find('"').map(|e| &s[..e]));
+        let title = block.find('>').and_then(|s| block[s + 1..].find("</a>").map(|e| strip_tags(&block[s + 1..s + 1 + e])));
+        let snippet = block
+            .find(SNIP)
+            .map(|s| &block[s..])
+            .and_then(|s| s.find('>').map(|g| &s[g + 1..]))
+            .and_then(|s| s.find("</a>").map(|e| strip_tags(&s[..e])))
+            .unwrap_or_default();
+        if let (Some(href), Some(title)) = (href, title)
+            && let Some(url) = unwrap_redirect(href)
+            && !title.is_empty()
+            && !hits.iter().any(|h| h.url == url)
+        {
+            hits.push(SearchHit { title, url, snippet });
+        }
+    }
+    hits
+}
+
+pub fn render_hits(query: &str, hits: &[SearchHit]) -> String {
+    if hits.is_empty() {
+        return format!("No results for \"{query}\".");
+    }
+    let mut out = format!("Search results for \"{query}\" (use web_fetch to read a page):\n");
+    for (n, h) in hits.iter().enumerate() {
+        out.push_str(&format!("\n{}. {}\n   {}\n", n + 1, h.title, h.url));
+        if !h.snippet.is_empty() {
+            out.push_str(&format!("   {}\n", h.snippet));
+        }
+    }
+    out
+}
+
 fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
@@ -349,5 +543,39 @@ mod tests {
         let c = client();
         let err = fetch(&c, "http://127.0.0.1.nip.io/").await.unwrap_err();
         assert!(err.contains("private or local") || err.contains("cannot resolve"), "{err}");
+    }
+
+    #[test]
+    fn parses_search_results() {
+        let html = r#"<div class="result"><h2><a rel="nofollow" class="result__a" href="https://ratatui.rs/">Ratatui &amp; <b>Rust</b></a></h2>
+<a class="result__snippet" href="https://ratatui.rs/">Cook up <b>terminal</b> UIs</a></div>
+<div><a class="result__a" href="https://duckduckgo.com/y.js?ad=1">Ad</a></div>
+<div><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fratatui%2Fratatui&amp;rut=x">GitHub</a></div>
+<div><a class="result__a" href="https://ratatui.rs/">Dup</a></div>"#;
+        let hits = parse_search(html, 10);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(
+            hits[0],
+            SearchHit { title: "Ratatui & Rust".into(), url: "https://ratatui.rs/".into(), snippet: "Cook up terminal UIs".into() }
+        );
+        assert_eq!(hits[1].url, "https://github.com/ratatui/ratatui");
+        assert_eq!(parse_search(html, 1).len(), 1);
+        assert!(render_hits("q", &hits).contains("2. GitHub"));
+    }
+
+    #[test]
+    fn parses_json_backends() {
+        let v = serde_json::json!({"results":[
+            {"title":"Ratatui","url":"https://ratatui.rs/","content":"TUIs in <strong>Rust</strong>"},
+            {"title":"","url":"https://x.dev/"},
+            {"title":"Bad","url":"javascript:alert(1)"},
+            {"title":"Docs","url":"https://docs.rs/ratatui","content":"API docs"}]});
+        let hits = json_hits(v.get("results"), "content", 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].snippet, "TUIs in Rust");
+        assert_eq!(json_hits(v.get("results"), "content", 1).len(), 1);
+        let brave = serde_json::json!({"web":{"results":[{"title":"A","url":"https://a.io","description":"d"}]}});
+        assert_eq!(json_hits(brave.pointer("/web/results"), "description", 5)[0].snippet, "d");
+        assert!(!format!("{:?}", SearchBackend::Brave { key: "sekrit".into() }).contains("sekrit"));
     }
 }

@@ -21,6 +21,16 @@ daemon. The managed-backend run also had Homebrew removed from `PATH`.
 | 9 | Status animations | boot sequence, loading bar, spinner, pulse, bounce, scan (checksum), download bar |
 | 10 | Clean exit with no background processes | Ctrl+C, `/quit`, SIGTERM, SIGHUP all stop llama-server. After SIGKILL the next launch reaps the orphan. |
 
+## Fix: local files and web in chat mode
+
+- **Problem:** in the default chat mode the model only had `web_fetch`, so asked about the project it tried `web_fetch file:///…`, failed, and then guessed. Models without tool support were told nothing and could pretend to have read things.
+- **Chat mode** now offers the read-only file tools (as in plan mode). Edits and commands still need build mode.
+- **`web_search`** tool with DuckDuckGo (default, no key), SearXNG or Brave backends. A bot-check refusal is reported as such, with a hint to `web_fetch` a known URL.
+- **Honesty:** the prompt forbids claiming tool use that didn't happen; models without tool support get a prompt saying they have no tools and pointing at `@file`/`@url`. Empty (JavaScript-only) pages are returned as failures, not as empty successes.
+- **Inline thinking** (`<|channel>thought…<channel|>`, `<think>…</think>`) that a server streams as content is moved to reasoning.
+- **Fixed:** a quick exit (`212 -p`) could lose the last turn from the session database.
+- Verified with Gemma 4 12B: asked for a project breakdown, it called `project_info`, `list_dir` and `read_file` and answered from the real files. With search blocked it said so instead of inventing results.
+
 ## Phase 6 (persistence and providers) and requested extras: done
 
 Verified in a real terminal (tmux) with Gemma 4 12B on the managed backend:
@@ -81,7 +91,7 @@ terminal. Demo project: a two-function Python module with a bug
 - **The context meter** updates after each message, not live during a multi-step turn.
 - **Keychain storage** is implemented and compiles on all platforms, but writing to the real macOS Keychain was not exercised during testing (to avoid modifying it). Environment variables work as before.
 - **Compaction quality** depends on the model; small models write weaker summaries. The full transcript is always kept.
-- **Web:** no JavaScript rendering (pages that need it come back mostly empty), no PDFs, and no search engine. `web_fetch` reads URLs; it doesn't search.
+- **Web:** no JavaScript rendering (such pages are reported to the model as unreadable) and no PDFs. The default DuckDuckGo search may be refused by its bot check after a burst of queries; SearXNG or Brave (`agent.search`) are the reliable options.
 - **Skills:** bundled scripts run through `run_command` (build mode, with approval). Models without tool support can only use skills activated with `/skill`.
 - **Model loading progress** is indeterminate, because llama.cpp exposes no load progress.
 - **Downloads** can be cancelled and resumed (`Esc`, then pull again). There is no separate pause button.

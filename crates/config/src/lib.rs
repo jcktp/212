@@ -144,11 +144,22 @@ pub struct AgentConfig {
     pub require_command_approval: bool,
     /// Web access for the model (`web_fetch`): `ask`, `allow` or `off`.
     pub web_access: String,
+    /// `web_search` backend: `duckduckgo`, `searxng` or `brave`.
+    pub search: String,
+    /// Base URL of a SearXNG instance (for `search = "searxng"`).
+    pub searxng_url: String,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { default_mode: "chat".into(), max_steps: 30, require_command_approval: true, web_access: "ask".into() }
+        Self {
+            default_mode: "chat".into(),
+            max_steps: 30,
+            require_command_approval: true,
+            web_access: "ask".into(),
+            search: "duckduckgo".into(),
+            searxng_url: String::new(),
+        }
     }
 }
 
@@ -336,6 +347,14 @@ impl Config {
             warnings.push(format!("agent.web_access '{}' must be ask, allow or off; using ask", self.agent.web_access));
             self.agent.web_access = d.agent.web_access.clone();
         }
+        if !["duckduckgo", "searxng", "brave"].contains(&self.agent.search.as_str()) {
+            warnings.push(format!("agent.search '{}' must be duckduckgo, searxng or brave; using duckduckgo", self.agent.search));
+            self.agent.search = d.agent.search.clone();
+        }
+        if self.agent.search == "searxng" && !self.agent.searxng_url.starts_with("http") {
+            warnings.push("agent.search = \"searxng\" needs agent.searxng_url (e.g. http://127.0.0.1:8888); using duckduckgo".into());
+            self.agent.search = d.agent.search.clone();
+        }
         if !["celsius", "fahrenheit"].contains(&self.ui.weather_units.as_str()) {
             warnings.push("ui.weather_units must be celsius or fahrenheit; using celsius".into());
             self.ui.weather_units = d.ui.weather_units.clone();
@@ -415,7 +434,9 @@ load_timeout_secs = 300
 default_mode = "chat"       # chat, plan, build
 max_steps = 30
 require_command_approval = true
-web_access = "ask"          # web_fetch tool and @https:// links: ask, allow, off
+web_access = "ask"          # web_search/web_fetch tools and @https:// links: ask, allow, off
+search = "duckduckgo"       # web_search backend: duckduckgo, searxng, brave (key: 212 key set brave)
+# searxng_url = "http://127.0.0.1:8888"
 
 [models]
 directory = "auto"

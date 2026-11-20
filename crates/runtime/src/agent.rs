@@ -78,6 +78,7 @@ impl AgentRun {
         };
         let mut stream = self.provider.chat(req);
         let mut s = Step::default();
+        let mut split = crate::think::ThinkSplit::default();
         loop {
             let next = tokio::select! {
                 n = stream.next() => n,
@@ -89,7 +90,10 @@ impl AgentRun {
                         StreamEvent::Text(t) => {
                             first_token.get_or_insert_with(Instant::now);
                             s.chunks += 1;
-                            s.text.push_str(t);
+                            for part in split.push(t) {
+                                self.emit_part(&mut s, part).await;
+                            }
+                            continue;
                         }
                         StreamEvent::Reasoning(r) => {
                             first_token.get_or_insert_with(Instant::now);
@@ -128,7 +132,24 @@ impl AgentRun {
                 None => break,
             }
         }
+        for part in split.finish() {
+            self.emit_part(&mut s, part).await;
+        }
         s
+    }
+
+    async fn emit_part(&self, s: &mut Step, part: crate::think::Part) {
+        let ev = match part {
+            crate::think::Part::Text(t) => {
+                s.text.push_str(&t);
+                StreamEvent::Text(t)
+            }
+            crate::think::Part::Reasoning(r) => {
+                s.reasoning.push_str(&r);
+                StreamEvent::Reasoning(r)
+            }
+        };
+        self.emit(Event::Delta(ev)).await;
     }
 
     pub async fn run(mut self, mut prompt_tokens: Option<u64>) {

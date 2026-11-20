@@ -61,6 +61,7 @@ pub struct ToolCtx {
     pub scrub_env: Vec<String>,
     pub skills: Vec<SkillRef>,
     pub http: Option<web::Client>,
+    pub search: web::SearchBackend,
 }
 
 /// A validated, ready-to-run tool call.
@@ -91,6 +92,7 @@ enum Action {
     Edit { path: PathBuf, rel: String, original: String, updated: String },
     Command { command: String, timeout: Duration },
     Fetch { url: String },
+    Search { query: String, max: usize },
     LoadSkill { skill: SkillRef },
 }
 
@@ -199,6 +201,16 @@ const SPECS: &[Spec] = &[
         kind: ToolKind::Network,
         description: "Fetch a web page or text document (http/https) and return its readable text. Use for documentation and links the user mentions.",
         params: || json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+    },
+    Spec {
+        name: "web_search",
+        kind: ToolKind::Network,
+        description: "Search the web and return the top results (title, URL, snippet). Use for current information or when you don't know the URL; then web_fetch the most relevant pages.",
+        params: || {
+            json!({"type":"object","properties":{
+                "query":{"type":"string"},
+                "max_results":{"type":"integer","description":"Number of results (default 8, max 15)"}},"required":["query"]})
+        },
     },
     Spec {
         name: "load_skill",
@@ -325,6 +337,11 @@ struct NoArgs {}
 #[derive(Deserialize)]
 struct FetchArgs {
     url: String,
+}
+#[derive(Deserialize)]
+struct SearchArgs {
+    query: String,
+    max_results: Option<usize>,
 }
 #[derive(Deserialize)]
 struct SkillArgs {
@@ -481,6 +498,20 @@ pub fn plan(name: &str, raw_args: &str, ctx: &ToolCtx) -> Result<Plan, String> {
                 Action::Fetch { url: url.to_string() },
             ))
         }
+        "web_search" => {
+            let a: SearchArgs = args(name, raw_args)?;
+            let query = a.query.split_whitespace().collect::<Vec<_>>().join(" ");
+            if query.is_empty() {
+                return Err("query must not be empty".into());
+            }
+            Ok(mk(
+                format!("search \"{}\"", one_line(&query)),
+                Some(format!("Sends the query to {}", ctx.search.describe())),
+                None,
+                "web:search".into(),
+                Action::Search { query, max: a.max_results.unwrap_or(8).clamp(1, 15) },
+            ))
+        }
         "load_skill" => {
             let a: SkillArgs = args(name, raw_args)?;
             let skill = ctx.skills.iter().find(|s| s.name.eq_ignore_ascii_case(a.name.trim())).cloned().ok_or_else(|| {
@@ -526,10 +557,25 @@ pub async fn execute(plan: &Plan, ctx: &ToolCtx) -> ToolOutput {
             None => ToolOutput::error("web access is disabled"),
             Some(c) => tokio::select! {
                 r = web::fetch(c, url) => match r {
+                    Ok(page) if page.text.trim().chars().count() < 40 => ToolOutput::error(format!(
+                        "{} returned no readable text (the page probably needs JavaScript). \
+                         Try an API endpoint, raw file or documentation URL instead; don't guess the content.",
+                        page.url
+                    )),
                     Ok(page) => {
                         let n = page.text.chars().count();
                         ToolOutput::ok(page.render(), format!("{} · {} chars", page.title.chars().take(50).collect::<String>(), n))
                     }
+                    Err(e) => ToolOutput::error(e),
+                },
+                _ = ctx.cancel.cancelled() => ToolOutput::error("cancelled"),
+            },
+        },
+        Action::Search { query, max } => match &ctx.http {
+            None => ToolOutput::error("web access is disabled"),
+            Some(c) => tokio::select! {
+                r = web::search(c, &ctx.search, query, *max) => match r {
+                    Ok(hits) => ToolOutput::ok(web::render_hits(query, &hits), format!("{} results", hits.len())),
                     Err(e) => ToolOutput::error(e),
                 },
                 _ = ctx.cancel.cancelled() => ToolOutput::error("cancelled"),
@@ -584,6 +630,7 @@ mod tests {
             scrub_env: vec!["TWO_ONE_TWO_TEST_SECRET".into()],
             skills: vec![],
             http: None,
+            search: Default::default(),
         }
     }
 

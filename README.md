@@ -125,7 +125,7 @@ inside the working directory can be attached. Files that look like secrets
 
 | Mode | What the model can do |
 | --- | --- |
-| `chat` (default) | talk only. No tools. |
+| `chat` (default) | conversation, plus read-only file tools and web search/fetch. No edits or commands. |
 | `plan` | read, list, find, grep, inspect the project and git history. Read-only. Ends with a plan. |
 | `build` | everything in plan, plus edit/create files, run commands and run tests |
 
@@ -159,9 +159,10 @@ keep nothing.
 ### Links and the web
 
 Put `@` before a link to include the page in your message:
-`summarize @https://example.com/post`. The model can also read pages itself
-with the `web_fetch` tool (in every mode). By default it asks first, per site,
-with "allow this site for the session". Pages are converted to text. Local and
+`summarize @https://example.com/post`. The model can also search the web
+(`web_search`, via DuckDuckGo, no key needed) and read pages (`web_fetch`) in
+every mode. By default it asks first, per site (searches once per session),
+with "allow for the session". Pages are converted to text. Local and
 private-network addresses are refused. Set `agent.web_access` to `allow` or
 `off`.
 

@@ -7,7 +7,7 @@ use common::proto::NoticeLevel;
 use crate::Runtime;
 
 pub const SERVICE: &str = "212";
-pub const PROVIDERS: &[&str] = &["openai", "anthropic", "compat", "huggingface"];
+pub const PROVIDERS: &[&str] = &["openai", "anthropic", "compat", "huggingface", "brave"];
 
 fn entry(provider: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE, provider).map_err(|e| format!("system keychain unavailable: {e}"))
@@ -43,7 +43,12 @@ impl Runtime {
         .unwrap_or_else(|e| Err(e.to_string()));
         match r {
             Ok(p) => {
-                self.notice(NoticeLevel::Success, format!("Saved the {p} key in the system keychain. Switch with /provider {p}.")).await
+                let next = match p.as_str() {
+                    "brave" => " Use it with agent.search = \"brave\".".to_string(),
+                    "huggingface" => String::new(),
+                    _ => format!(" Switch with /provider {p}."),
+                };
+                self.notice(NoticeLevel::Success, format!("Saved the {p} key in the system keychain.{next}")).await
             }
             Err(e) => {
                 self.notice(NoticeLevel::Error, format!("Could not store the key: {e}. You can use an environment variable instead.")).await

@@ -20,6 +20,7 @@ pub mod permissions;
 mod providers_setup;
 mod sessions_ops;
 mod skills;
+mod think;
 mod web;
 
 use std::collections::{HashMap, HashSet};
@@ -250,6 +251,13 @@ impl Runtime {
                 Some(msg) = internal.recv() => self.on_internal(msg).await,
             }
         }
+        // A finished turn is announced (TurnEnd) just before its messages reach
+        // us; record anything already queued so a quick exit doesn't lose it.
+        while let Ok(msg) = internal.try_recv() {
+            if let Internal::Generated { .. } = msg {
+                self.on_internal(msg).await;
+            }
+        }
         self.shutdown().await;
         let _ = self.events.send(Event::ShutdownComplete).await;
     }
@@ -407,7 +415,7 @@ impl Runtime {
                 self.sync_session_settings();
                 self.snapshot().await;
                 let text = match m {
-                    AgentMode::Chat => "Mode: chat — conversation only; no file access or commands.",
+                    AgentMode::Chat => "Mode: chat — can read project files and the web; no edits or commands.",
                     AgentMode::Plan => "Mode: plan — the model can read and search this project (read-only) and propose a plan.",
                     AgentMode::Build => {
                         "Mode: build — the model can edit files and run commands. Every edit and command asks for your approval."

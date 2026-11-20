@@ -34,7 +34,7 @@ pub enum Policy {
 /// Tool kinds offered to the model in each mode.
 pub fn offered(mode: AgentMode) -> &'static [ToolKind] {
     match mode {
-        AgentMode::Chat => &[ToolKind::Network, ToolKind::Skill],
+        AgentMode::Chat => &[ToolKind::Read, ToolKind::Network, ToolKind::Skill],
         AgentMode::Plan => &[ToolKind::Read, ToolKind::Network, ToolKind::Skill],
         AgentMode::Build => &[ToolKind::Read, ToolKind::Write, ToolKind::Execute, ToolKind::Network, ToolKind::Skill],
     }
@@ -110,6 +110,9 @@ impl Runtime {
                 }
                 body.push(match plan.kind {
                     ToolKind::Write => "The model wants to change this file:".to_string(),
+                    ToolKind::Network if plan.tool == "web_search" => {
+                        "The model wants to search the web (the query leaves your machine):".to_string()
+                    }
                     ToolKind::Network => "The model wants to read this web page (its content will be sent to the model):".to_string(),
                     _ => format!("The model wants to run this in {}:", self.cwd.display()),
                 });
@@ -117,6 +120,7 @@ impl Runtime {
                 if session_option {
                     options.push(match plan.kind {
                         ToolKind::Write => "Allow all edits this session".into(),
+                        ToolKind::Network if plan.tool == "web_search" => "Allow web searches this session".into(),
                         ToolKind::Network => format!("Allow {} this session", plan.grant_key.trim_start_matches("web:")),
                         _ => "Always allow this command this session".into(),
                     });
@@ -147,7 +151,7 @@ impl Runtime {
             self.notice(
                 NoticeLevel::Warn,
                 format!(
-                    "{model}'s chat template does not declare tool support, so it runs without tools in {} mode. \
+                    "{model}'s chat template does not declare tool support, so it can't read files or use the web in {} mode. \
                      For agent work try a tool-capable model (e.g. Qwen3 4B/8B — see /recommend).",
                     self.mode.as_str()
                 ),
@@ -171,6 +175,7 @@ mod tests {
             scrub_env: vec![],
             skills: vec![],
             http: None,
+            search: Default::default(),
         };
         tools::plan(tool, args, &ctx).unwrap()
     }
@@ -185,7 +190,9 @@ mod tests {
         let risky = plan(tmp.path(), "run_command", r#"{"command":"rm -rf build"}"#);
         let none = HashSet::new();
         use AgentMode::*;
-        assert!(matches!(decide(Chat, &read, &none, true), Policy::Deny(_)));
+        assert_eq!(decide(Chat, &read, &none, true), Policy::Allow);
+        assert!(matches!(decide(Chat, &edit, &none, true), Policy::Deny(_)));
+        assert!(matches!(decide(Chat, &cmd, &none, true), Policy::Deny(_)));
         assert_eq!(decide(Plan, &read, &none, true), Policy::Allow);
         assert!(matches!(decide(Plan, &edit, &none, true), Policy::Deny(r) if r.contains("plan mode")));
         assert!(matches!(decide(Plan, &cmd, &none, true), Policy::Deny(_)));
@@ -206,8 +213,8 @@ mod tests {
         assert!(matches!(decide_with(Build, &web, &none, true, "off"), Policy::Deny(_)));
         let host: HashSet<String> = ["web:docs.rs".to_string()].into();
         assert_eq!(decide_with(Plan, &web, &host, true, "ask"), Policy::Allow);
-        assert_eq!(offered_with(Chat, "off", false), Vec::<ToolKind>::new());
-        assert_eq!(offered_with(Chat, "ask", true), vec![ToolKind::Network, ToolKind::Skill]);
+        assert_eq!(offered_with(Chat, "off", false), vec![ToolKind::Read]);
+        assert_eq!(offered_with(Chat, "ask", true), vec![ToolKind::Read, ToolKind::Network, ToolKind::Skill]);
         // A grant for one command doesn't cover another.
         let other = plan(tmp.path(), "run_command", r#"{"command":"ls -la"}"#);
         assert_eq!(decide(Build, &other, &grants, true), Policy::Ask { session_option: true });

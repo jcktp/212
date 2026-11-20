@@ -50,7 +50,9 @@ disturbing your comments or formatting**.
 | --- | --- | --- |
 | `default_mode` | `"chat"` | `chat`, `plan`, `build` |
 | `max_steps` | `30` | 1 – 500. Model calls per user message before the agent stops and asks you to say "continue". |
-| `web_access` | `"ask"` | `ask` (per site, with a session option), `allow`, or `off` (no `web_fetch` tool, `@https://` links not fetched) |
+| `web_access` | `"ask"` | `ask` (per site, with a session option; searches once per session), `allow`, or `off` (no `web_search`/`web_fetch` tools, `@https://` links not fetched) |
+| `search` | `"duckduckgo"` | `web_search` backend. `duckduckgo` needs no key but may refuse automated queries (bot check). `searxng` uses `searxng_url` (enable `json` under `search.formats` in its `settings.yml`). `brave` uses the Brave Search API key from `212 key set brave` or `BRAVE_API_KEY`. |
+| `searxng_url` | `""` | Base URL of a SearXNG instance, e.g. `http://127.0.0.1:8888`. Local addresses are allowed here because you configured them. |
 | `require_command_approval` | `true` | `false` runs non-risky commands without asking. Risky commands always ask, and edits always ask unless allowed for the session. |
 
 ### `[models]`
